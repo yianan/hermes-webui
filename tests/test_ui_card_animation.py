@@ -49,7 +49,7 @@ def test_thinking_card_header_includes_copy_button_that_does_not_toggle_card():
     assert "function _copyThinkingText(btn){" in UI_JS
     assert "const copyBtn=`<button class=\"thinking-copy-btn\"" in UI_JS
     assert "event.stopPropagation();_copyThinkingText(this)" in UI_JS
-    assert "card.querySelector('.thinking-card-body pre')" in UI_JS
+    assert "body.dataset.thinkingRaw" in UI_JS
     assert "_copyText(text).then(()=>{" in UI_JS
     assert "btn.innerHTML=li('check',12);" in UI_JS
     assert ".thinking-copy-btn{" in COMPACT_CSS
@@ -58,9 +58,16 @@ def test_thinking_card_header_includes_copy_button_that_does_not_toggle_card():
 
 def test_live_thinking_updates_existing_card_body_in_place():
     assert "function _renderThinkingInto(row,text='')" in UI_JS
-    assert "row.querySelector('.thinking-card-body pre')" in UI_JS
-    assert "pre.textContent=clean" in UI_JS
+    assert "body.querySelector('.thinking-markdown')" in UI_JS
+    assert "markdown.innerHTML=(typeof renderMd==='function')?renderMd(clean):esc(clean)" in UI_JS
     assert "_renderThinkingInto(row,text);" in UI_JS
+
+
+def test_thinking_card_body_renders_markdown_and_keeps_raw_copy_source():
+    assert "function _thinkingBodyHtml(clean){" in UI_JS
+    assert '<div class="thinking-markdown">${rendered}</div>' in UI_JS
+    assert 'data-thinking-raw="${esc(raw)}"' in UI_JS
+    assert "const rendered=(typeof renderMd==='function')?renderMd(raw):esc(raw);" in UI_JS
 
 
 def test_thinking_card_uses_panel_chrome_with_gold_palette():

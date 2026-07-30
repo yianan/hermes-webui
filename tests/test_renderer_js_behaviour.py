@@ -803,3 +803,12 @@ class TestBareFileUrlMediaRendering:
         # Labeled anchors keep the normal link path (routed to /api/media as a link,
         # not auto-loaded as an <img>).
         assert "<img" not in out
+        assert "api/media?path=" in out
+        assert 'target="_blank"' in out
+
+    def test_markdown_anchor_file_directory_reveals_in_file_manager(self, driver_path):
+        out = _render(driver_path, "[Open outputs](file:///tmp/workspace/outputs/)")
+        assert 'class="msg-folder-reveal-link"' in out
+        assert 'href="#reveal-folder=%2Ftmp%2Fworkspace%2Foutputs%2F"' in out
+        assert "api/media?path=" not in out
+        assert 'target="_blank"' not in out

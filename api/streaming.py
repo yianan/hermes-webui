@@ -101,6 +101,44 @@ def _compact_for_echo_compare(value: str) -> str:
     return re.sub(r'\s+', '', str(value or ''))
 
 
+def _expand_webui_skill_slash_message(msg_text: str, *, task_id: str | None = None) -> str:
+    """Expand WebUI standalone skill slash commands before the model sees them.
+
+    CLI/gateway paths expand `/skill-name args` through
+    agent.skill_commands. The WebUI streaming path previously sent that raw
+    text to the model, which let the model choose a different skill with
+    `skill_view`. Keep WebUI aligned with CLI for installed standalone skills
+    while leaving non-skill slash commands as ordinary WebUI command input.
+    """
+    raw = str(msg_text or "")
+    stripped = raw.strip()
+    if not stripped.startswith("/") or stripped.startswith("//"):
+        return raw
+    parts = stripped.split(maxsplit=1)
+    command = parts[0].lstrip("/")
+    user_instruction = parts[1].strip() if len(parts) > 1 else ""
+    if not command:
+        return raw
+    try:
+        from agent.skill_commands import (
+            build_skill_invocation_message,
+            resolve_skill_command_key,
+        )
+
+        cmd_key = resolve_skill_command_key(command)
+        if not cmd_key:
+            return raw
+        expanded = build_skill_invocation_message(
+            cmd_key,
+            user_instruction,
+            task_id=task_id,
+        )
+        return expanded or raw
+    except Exception:
+        logger.debug("Failed to expand WebUI skill slash command", exc_info=True)
+        return raw
+
+
 def _strip_compact_echo_suffix(value: str, suffix: str, *, search_window: int = 4096) -> tuple[str, bool]:
     """Remove ``suffix`` from ``value`` when they match after whitespace folding."""
     raw = str(value or '')
@@ -9539,6 +9577,11 @@ def _run_agent_streaming(
             _agent_msg_text = msg_text
             if _process_notifications:
                 _agent_msg_text = "\n\n".join([*_process_notifications, msg_text]).strip()
+            else:
+                _agent_msg_text = _expand_webui_skill_slash_message(
+                    _agent_msg_text,
+                    task_id=session_id,
+                )
             user_message = _build_native_multimodal_message(workspace_ctx, _agent_msg_text, attachments, workspace, cfg=_cfg)
             _persistent_state_before = _persistent_state_snapshot(_profile_home)
             _run_conversation_kwargs = dict(

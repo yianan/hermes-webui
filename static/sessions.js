@@ -1394,14 +1394,18 @@ async function newSession(flash, options={}){
     _messagesTruncated=false;
     _oldestIdx=0;
     clearLiveToolCards();
-    // One-shot profile-switch workspace wins first; otherwise prefer the profile default.
+    // One-shot profile/workspace switches may pin the next chat. A generic
+    // New Chat should not silently inherit the current/demo workspace; when no
+    // explicit workspace is supplied, omit the field and let the server use the
+    // profile's neutral configured default.
     const switchWs=S._profileSwitchWorkspace;
     S._profileSwitchWorkspace=null;
-    const inheritWs=switchWs||(S._profileDefaultWorkspace||null)||(S.session?S.session.workspace:null);
     const reqBody={
-      workspace:inheritWs,
       profile:S.activeProfile||'default',
     };
+    const explicitWs=(options&&Object.prototype.hasOwnProperty.call(options,'workspace'))?options.workspace:null;
+    const inheritWs=switchWs||explicitWs||null;
+    if(inheritWs) reqBody.workspace=inheritWs;
     if(S.session&&S.session.session_id) reqBody.prev_session_id=S.session.session_id;
     // Three-value worktree contract (#6022): explicit true/false is forwarded
     // verbatim; an ABSENT key lets the server apply the agent's config-level

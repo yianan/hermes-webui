@@ -32,12 +32,16 @@ class _FakeLoadedPlugin:
 
 
 class _FakePluginManager:
-    def __init__(self, plugins):
+    def __init__(self, plugins, skills=None):
         self._plugins = plugins
+        self._skills = skills or {}
         self.discover_calls = []
 
     def discover_and_load(self, force=False):
         self.discover_calls.append(force)
+
+    def list_plugin_skills(self, plugin_name):
+        return sorted(self._skills.get(plugin_name, []))
 
 
 class TestPluginsApi:
@@ -92,6 +96,8 @@ class TestPluginsApi:
             "activation": "enabled",
             "is_active_provider": False,
             "hooks": ["pre_tool_call", "post_tool_call"],
+            "can_disable": True,
+            "can_uninstall": True,
         }]
         serialized = repr(payload)
         assert "/home/michael" not in serialized
@@ -111,6 +117,153 @@ class TestPluginsApi:
             "pre_llm_call",
             "post_llm_call",
         ]
+
+    def test_api_plugins_exposes_registered_plugin_skills(self):
+        manager = _FakePluginManager({
+            "finance": _FakeLoadedPlugin(
+                _FakeManifest(
+                    name="finance",
+                    key="finance",
+                    description="Finance workflows",
+                ),
+                enabled=True,
+            )
+        }, skills={"finance": ["lbo-model-build", "dcf-model-build"]})
+
+        payload = self._capture_plugins_response(manager)
+
+        assert payload["plugins"][0]["skills"] == [
+            {"name": "dcf-model-build", "qualified_name": "finance:dcf-model-build"},
+            {"name": "lbo-model-build", "qualified_name": "finance:lbo-model-build"},
+        ]
+
+    def test_plugin_skill_save_updates_registered_file(self, tmp_path):
+        import api.routes as routes
+
+        skill_file = tmp_path / "SKILL.md"
+        skill_file.write_text("old", encoding="utf-8")
+        captured = {}
+
+        def fake_j(handler, payload, status=200, extra_headers=None):
+            captured.update(payload)
+            captured["status"] = status
+            return True
+
+        with patch("api.routes._plugin_skill_edit_target", return_value=skill_file), \
+             patch("api.routes.j", side_effect=fake_j):
+            handled = routes._handle_skill_save(
+                MagicMock(),
+                {"name": "finance:lbo-model-build", "content": "updated"},
+            )
+
+        assert handled is True
+        assert captured["ok"] is True
+        assert captured["plugin_skill"] is True
+        assert skill_file.read_text(encoding="utf-8") == "updated"
+
+    def test_bundled_plugin_skill_customize_and_reset_are_profile_local(self, tmp_path):
+        import api.routes as routes
+
+        original = tmp_path / "bundled" / "SKILL.md"
+        original.parent.mkdir()
+        original.write_text("bundled body", encoding="utf-8")
+        override = tmp_path / "home" / "plugin-skill-overrides" / "finance" / "dcf" / "SKILL.md"
+        manager = MagicMock()
+
+        def info(_name):
+            return {
+                "source": "bundled",
+                "original_path": original,
+                "effective_path": override if override.exists() else original,
+                "override_path": override,
+                "customized": override.exists(),
+            }
+
+        manager.get_plugin_skill_info.side_effect = info
+        captured = {}
+
+        def fake_j(handler, payload, status=200, extra_headers=None):
+            captured.clear()
+            captured.update(payload)
+            return True
+
+        with patch("hermes_cli.plugins.discover_plugins"), \
+             patch("hermes_cli.plugins.get_plugin_manager", return_value=manager), \
+             patch("api.profiles.get_active_hermes_home", return_value=tmp_path / "home"), \
+             patch("api.routes.j", side_effect=fake_j):
+            assert routes._handle_plugin_skill_lifecycle(
+                MagicMock(), {"name": "finance:dcf", "action": "customize"}
+            ) is True
+            assert override.read_text(encoding="utf-8") == "bundled body"
+            assert captured["customized"] is True
+
+            assert routes._handle_plugin_skill_lifecycle(
+                MagicMock(), {"name": "finance:dcf", "action": "reset"}
+            ) is True
+            assert not override.exists()
+            assert captured["customized"] is False
+
+    def test_user_plugin_skill_delete_removes_source_and_manifest_entry(self, tmp_path):
+        import api.routes as routes
+
+        plugin_root = tmp_path / "finance"
+        skill_file = plugin_root / "skills" / "dcf" / "SKILL.md"
+        skill_file.parent.mkdir(parents=True)
+        skill_file.write_text("body", encoding="utf-8")
+        manifest = plugin_root / "plugin.yaml"
+        manifest.write_text("name: finance\nprovides_skills:\n  - dcf\n  - lbo\n", encoding="utf-8")
+        manager = MagicMock()
+        manager.get_plugin_skill_info.return_value = {
+            "source": "user",
+            "plugin_path": str(plugin_root),
+            "original_path": skill_file,
+            "effective_path": skill_file,
+            "override_path": tmp_path / "override" / "SKILL.md",
+        }
+        captured = {}
+
+        def fake_j(handler, payload, status=200, extra_headers=None):
+            captured.update(payload)
+            return True
+
+        with patch("hermes_cli.plugins.discover_plugins"), \
+             patch("hermes_cli.plugins.get_plugin_manager", return_value=manager), \
+             patch("api.routes._set_plugin_skill_enabled_in_active_config") as set_enabled, \
+             patch("api.routes.j", side_effect=fake_j):
+            routes._handle_plugin_skill_lifecycle(
+                MagicMock(), {"name": "finance:dcf", "action": "delete"}
+            )
+
+        set_enabled.assert_called_once_with("finance:dcf", True)
+        assert captured["deleted"] is True
+        assert not skill_file.parent.exists()
+        assert "  - dcf\n" not in manifest.read_text(encoding="utf-8")
+        assert "  - lbo\n" in manifest.read_text(encoding="utf-8")
+        manager.discover_and_load.assert_called_once_with(force=True)
+
+    def test_plugin_lifecycle_ui_uses_compact_header_and_skill_chips(self):
+        js = read("static/panels.js")
+        css = read("static/style.css")
+
+        assert 'class="plugin-header-actions"' in js
+        assert 'class="plugin-lifecycle-toggle-input"' in js
+        assert 'class="plugin-uninstall-btn"' in js
+        assert 'class="${chipClass}"' in js
+        assert 'aria-label="Delete ${esc(name)}"' in js
+        assert "if(action==='delete')" in js
+        assert "title:'Delete skill?'" in js
+        assert "if(action==='disable'&&!confirm" not in js
+        assert "if(action==='uninstall')" in js
+        assert "title:'Uninstall plugin?'" in js
+        assert "loadPluginsPanel({focusPluginKey:key})" in js
+        assert "focusCard.scrollIntoView({block:'center',inline:'nearest'})" in js
+        assert "is-plugin-inactive" in js
+        assert "Inactive while plugin is disabled" in js
+        assert '"inactive": not enabled_flag' in read("api/routes.py")
+        assert 'info.get("disabled") or runtime_path is None' in read("api/routes.py")
+        assert "plugin-lifecycle-actions" not in js
+        assert ".plugin-skill-chip" in css
+        assert ".plugin-header-actions" in css
 
     def test_api_plugins_filters_non_visibility_hooks_and_manifest_paths(self):
         manager = _FakePluginManager({
@@ -272,6 +425,11 @@ class TestPluginsSettingsUi:
         assert "api('/api/plugins')" in js
         assert "_buildPluginCard" in js
         assert "plugin-hook-badge" in js
+        assert "plugin-skill-badge" in js
+        assert "qualified_name" in js
+        assert "openPluginSkillFromCard" in js
+        assert "backToPluginFromSkill" in js
+        assert "hermesPluginSkill" in js
         assert "esc(plugin.description" in js
         segment = js[js.find("function _buildPluginCard"):js.find("// ── Plugin pages")]
         assert ".callback" not in segment

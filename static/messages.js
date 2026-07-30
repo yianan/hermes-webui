@@ -3957,6 +3957,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     ].join(',');
     blocks.querySelectorAll(selector).forEach(row=>{
       const textNode=row.querySelector&&(
+        row.querySelector('.thinking-markdown') ||
         row.querySelector('.thinking-card-body pre') ||
         row.querySelector('.thinking-card-body')
       );

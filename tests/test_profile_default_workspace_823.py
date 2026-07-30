@@ -47,19 +47,25 @@ class TestProfileDefaultWorkspacePersistence:
             "newSession must null S._profileSwitchWorkspace after consuming it"
         )
 
-    def test_new_session_still_inherits_default_workspace(self):
-        """newSession must still pass a workspace to /api/session/new,
-        now via the _profileSwitchWorkspace -> _profileDefaultWorkspace -> current session chain."""
+    def test_generic_new_session_omits_default_workspace(self):
+        """Generic New Chat must not pin the previous/demo workspace.
+
+        The persistent profile default remains available for blank-page display
+        and explicit system-created workspace sessions, but normal New Chat
+        omits workspace so the backend can apply the neutral configured default.
+        """
         src = read('static/sessions.js')
         m = re.search(r'async function newSession\(.*?\n\}', src, re.DOTALL)
         assert m
         fn = m.group(0)
-        # inheritWs must be computed and passed to /api/session/new
-        assert 'inheritWs' in fn or 'inherit' in fn.lower(), (
-            "newSession must compute an inheritWs from switch/default/current workspace"
+        assert 'const explicitWs=' in fn, (
+            "newSession must accept an explicit workspace option for system-created sessions"
         )
-        assert '_profileDefaultWorkspace' in fn, (
-            "newSession must prefer S._profileDefaultWorkspace before current session workspace"
+        assert 'S.session?S.session.workspace' not in fn, (
+            "generic New Chat must not inherit the current session workspace"
+        )
+        assert 'if(inheritWs) reqBody.workspace=inheritWs' in fn, (
+            "newSession must only pass workspace when one was explicitly selected"
         )
 
 
