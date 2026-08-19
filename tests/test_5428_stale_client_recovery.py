@@ -166,6 +166,32 @@ def test_node_equal_versions_no_banner():
     assert result["display"] != "flex", f"Banner wrongly shown for equal versions: {result}"
 
 
+def test_node_matching_local_bundle_token_no_banner():
+    """A local asset token must compare to the server bundle token, not its base release."""
+    helpers = _extract_skew_helpers(PANELS_JS.read_text(encoding="utf-8"))
+    result = _run_harness(
+        _make_stub("v1-local.123"),
+        helpers,
+        'checkWebUIVersionSkew({ webui_version: "v1", webui_bundle_version: "v1-local.123" });',
+    )
+    assert result["display"] != "flex", (
+        f"Banner wrongly shown for matching local bundle token: {result}"
+    )
+
+
+def test_node_stale_local_bundle_token_shows_banner():
+    """A genuinely older local asset bundle must still trigger recovery."""
+    helpers = _extract_skew_helpers(PANELS_JS.read_text(encoding="utf-8"))
+    result = _run_harness(
+        _make_stub("v1-local.122"),
+        helpers,
+        'checkWebUIVersionSkew({ webui_version: "v1", webui_bundle_version: "v1-local.123" });',
+    )
+    assert result["display"] == "flex", (
+        f"Banner not shown for stale local bundle token: {result}"
+    )
+
+
 def test_node_missing_server_version_no_banner():
     """Missing webui_version in settings keeps banner hidden."""
     helpers = _extract_skew_helpers(PANELS_JS.read_text(encoding="utf-8"))

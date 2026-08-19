@@ -664,7 +664,7 @@ def test_transparent_event_row_quiet_metadata_visual_rhythm():
     assert "background:transparent;" in _pre_block
     assert "border-left:2px solid var(--border-subtle);" in _pre_block
     assert "max-height:none;" in _pre_block
-    assert ".transparent-event-row .thinking-card-body pre{" in STYLE_CSS
+    assert ".transparent-event-row .thinking-markdown{" in STYLE_CSS
     assert "border:0;" in STYLE_CSS
     assert "border-radius:0;" in STYLE_CSS
     assert "margin-top:0;" in STYLE_CSS
@@ -700,6 +700,9 @@ def test_transparent_event_row_quiet_metadata_visual_rhythm():
     assert "order:" not in thinking_preview_block
     assert "opacity:.6;" in STYLE_CSS
     assert "font-size:.85em;" in STYLE_CSS
+    assert ".transparent-event-row .thinking-card.open .transparent-event-thinking-preview{\n  display:none;\n}" in STYLE_CSS
+    assert ".transparent-event-thinking-preview code{" in STYLE_CSS
+    assert ".transparent-event-thinking-preview img,\n.transparent-event-thinking-preview table{\n  display:none;\n}" in STYLE_CSS
 
     # Per-row copy button still attached for both tool and thinking rows.
     assert "function _attachCopyButton" in UI_JS
@@ -713,6 +716,10 @@ def test_transparent_event_row_quiet_metadata_visual_rhythm():
     assert "if(copy&&copy.parentNode!==header) header.appendChild(copy)" in decorator_block
     assert "if(toggle&&toggle.parentNode!==header) header.appendChild(toggle)" in decorator_block
     assert "preview.className='transparent-event-preview transparent-event-thinking-preview'" in decorator_block
+    assert "const rawPreview=_transparentEventPreview(opts.preview||opts.text||row.textContent||'')" in decorator_block
+    assert "previewSource.innerHTML=renderMd(rawPreview)" in decorator_block
+    assert "const inlinePreview=document.createElement('span')" in decorator_block
+    assert "if(previewHtml) preview.innerHTML=previewHtml" in decorator_block
 
     # Bug fix: thinking blocks persist after the stream stops. removeThinking()
     # and finalizeThinkingCard() must not delete the transparent thinking row;

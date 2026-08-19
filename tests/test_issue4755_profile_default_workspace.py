@@ -79,7 +79,12 @@ def _run_node(script: str) -> dict:
     return json.loads(result.stdout)
 
 
-def _new_session_driver(session_workspace: str, default_workspace: str, switch_workspace: str | None) -> str:
+def _new_session_driver(
+    session_workspace: str,
+    default_workspace: str,
+    switch_workspace: str | None,
+    option_workspace: str | None = None,
+) -> str:
     new_session = _extract_async_function(SESSIONS_JS.read_text(encoding="utf-8"), "newSession")
     return textwrap.dedent(
         f"""
@@ -119,7 +124,8 @@ def _new_session_driver(session_workspace: str, default_workspace: str, switch_w
         function renderMessages(){{}}
         function loadDir(){{return Promise.resolve();}}
         {new_session}
-        newSession().then(()=>{{
+        const callOptions={{{"workspace: " + json.dumps(option_workspace) if option_workspace is not None else ""}}};
+        newSession(undefined, callOptions).then(()=>{{
           process.stdout.write(JSON.stringify({{captured,switchWorkspace:S._profileSwitchWorkspace}}));
         }}).catch(err=>{{
           console.error(err && err.stack || err);
@@ -130,7 +136,7 @@ def _new_session_driver(session_workspace: str, default_workspace: str, switch_w
 
 
 @node_test
-def test_new_session_prefers_profile_default_over_current_session_workspace():
+def test_generic_new_session_omits_workspace_instead_of_inheriting_demo_context():
     payload = _run_node(_new_session_driver(
         session_workspace="/current-workspace",
         default_workspace="/profile-default",
@@ -138,7 +144,7 @@ def test_new_session_prefers_profile_default_over_current_session_workspace():
     ))
 
     assert payload["captured"]["path"] == "/api/session/new"
-    assert payload["captured"]["body"]["workspace"] == "/profile-default"
+    assert "workspace" not in payload["captured"]["body"]
     assert payload["captured"]["body"]["prev_session_id"] == "previous-session"
 
 
@@ -152,6 +158,18 @@ def test_new_session_one_shot_switch_workspace_still_wins_and_clears():
 
     assert payload["captured"]["body"]["workspace"] == "/explicit-switch"
     assert payload["switchWorkspace"] is None
+
+
+@node_test
+def test_explicit_workspace_option_still_pins_system_created_session():
+    payload = _run_node(_new_session_driver(
+        session_workspace="/current-workspace",
+        default_workspace="/profile-default",
+        switch_workspace=None,
+        option_workspace="/explicit-workspace",
+    ))
+
+    assert payload["captured"]["body"]["workspace"] == "/explicit-workspace"
 
 
 @node_test

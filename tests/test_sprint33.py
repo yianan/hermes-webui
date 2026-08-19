@@ -78,6 +78,15 @@ def test_auth_disabled_warning_uses_status_payload_without_extra_settings_fetch(
     assert "api('/api/settings')" not in body
 
 
+def test_acknowledged_auth_warning_hides_navigation_dot():
+    src = read("static/panels.js")
+    match = re.search(r"function _updateAuthWarningBadge\(authStatus\)\{(.*?)\n\}", src, re.DOTALL)
+    assert match, "_updateAuthWarningBadge(authStatus) not found"
+    body = match.group(1)
+    assert "if(!authDisabled||acknowledged){ el.style.display='none'; return; }" in body
+    assert "acknowledged?'#e8a030':'#e05'" not in body
+
+
 def test_acknowledgement_save_failure_uses_i18n_toast():
     src = read("static/panels.js")
     match = re.search(r"async function _setAuthDisabledAck\(checked\)\{(.*?)\n\}", src, re.DOTALL)

@@ -428,6 +428,16 @@ def get_profile_default_workspace() -> str:
     return _profile_default_workspace()
 
 
+def get_neutral_default_workspace() -> str:
+    """Return the configured profile default without consulting last workspace.
+
+    Generic New Chat should start from the user's configured/default workspace,
+    not the last project the user happened to open. Explicit workspace actions
+    still pass a workspace directly.
+    """
+    return _profile_default_workspace()
+
+
 def get_last_workspace() -> str:
     remote_cwd = _remote_terminal_cwd()
 

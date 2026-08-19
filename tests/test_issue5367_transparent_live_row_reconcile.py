@@ -1694,6 +1694,7 @@ class FakeElement {
     this.children = [];
     this.parentNode = null;
     this.attributes = Object.create(null);
+    this.dataset = Object.create(null);
     this._textContent = '';
     this._innerHTML = '';
     this.innerHTMLSetCount = 0;
@@ -1775,12 +1776,14 @@ function thinkingRow(text, preview){
   previewEl.textContent = preview;
   const body = new FakeElement('div');
   body.className = 'thinking-card-body';
+  body.dataset.thinkingRaw = text;
   body.scrollTop = 37;
-  const pre = new FakeElement('pre');
-  pre.textContent = text;
+  const markdown = new FakeElement('div');
+  markdown.className = 'thinking-markdown';
+  markdown.textContent = text;
   header.appendChild(label);
   header.appendChild(previewEl);
-  body.appendChild(pre);
+  body.appendChild(markdown);
   card.appendChild(header);
   card.appendChild(body);
   row.appendChild(card);
@@ -1800,17 +1803,23 @@ eval(extractFunc('_refreshTransparentLiveRow'));
 
 const existing = thinkingRow('short thought', 'short thought');
 const originalBody = existing.querySelector('.thinking-card-body');
-const originalPre = existing.querySelector('.thinking-card-body pre');
+const originalMarkdown = existing.querySelector('.thinking-markdown');
 const candidate = thinkingRow('long thought\\n'.repeat(80), 'long thought');
+global._renderThinkingInto = (row, text)=>{
+  const body = row.querySelector('.thinking-card-body');
+  const markdown = body && body.querySelector('.thinking-markdown');
+  if(body) body.dataset.thinkingRaw = text;
+  if(markdown) markdown.textContent = text;
+};
 const refreshed = _refreshTransparentLiveRow(existing, candidate);
 const refreshedBody = refreshed.querySelector('.thinking-card-body');
-const refreshedPre = refreshed.querySelector('.thinking-card-body pre');
+const refreshedMarkdown = refreshed.querySelector('.thinking-markdown');
 const refreshedPreview = refreshed.querySelector('.transparent-event-thinking-preview');
 process.stdout.write(JSON.stringify({
   sameRow: refreshed === existing,
   sameBody: refreshedBody === originalBody,
-  samePre: refreshedPre === originalPre,
-  textUpdated: refreshedPre.textContent === 'long thought\\n'.repeat(80),
+  sameMarkdown: refreshedMarkdown === originalMarkdown,
+  textUpdated: refreshedBody.dataset.thinkingRaw === 'long thought\\n'.repeat(80) && refreshedMarkdown.textContent === 'long thought\\n'.repeat(80),
   previewUpdated: refreshedPreview.textContent === 'long thought',
   scrollTopPreserved: refreshedBody.scrollTop === 37,
   innerHTMLSetCount: refreshed.innerHTMLSetCount,
@@ -1820,7 +1829,7 @@ process.stdout.write(JSON.stringify({
     data = _run_node_script(script, str(ROOT / "static" / "ui.js"))
     assert data["sameRow"] is True
     assert data["sameBody"] is True
-    assert data["samePre"] is True
+    assert data["sameMarkdown"] is True
     assert data["textUpdated"] is True
     assert data["previewUpdated"] is True
     assert data["scrollTopPreserved"] is True
