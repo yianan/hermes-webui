@@ -38,6 +38,8 @@ let _pendingSettingsTargetPanel = null; // destination selected while settings h
 let _logsAutoRefreshTimer = null;
 let _lastLogsLines = [];
 let _logsSeverityFilter = 'all';
+let _gmailWatcherNotifyTimer = null;
+let _gmailWatcherLastAlertKey = localStorage.getItem('hermes-gmail-watcher-last-alert') || '';
 
 // Map of panel names → i18n keys for the app titlebar label.
 const APP_TITLEBAR_KEYS = {
@@ -2887,7 +2889,7 @@ function checkWebUIVersionSkew(settings){
   try{
     if(!settings) return;
     const client=_currentWebUIBundleVersion();
-    const server=_normalizeWebUIVersion(settings.webui_version);
+    const server=_normalizeWebUIVersion(settings.webui_bundle_version||settings.webui_version);
     if(!client||!server) return;
     if(client===server) return;
     _showStaleWebUIClientBanner(client,server);
@@ -5239,12 +5241,23 @@ async function clearConversation() {
 }
 
 // ── Skills panel ──
+let _optionalSkillsData = null;
+let _optionalSkillsCollapsedInitialized = false;
+
 async function loadSkills() {
-  if (_skillsData) { renderSkills(_skillsData); return; }
+  if (_skillsData && _optionalSkillsData) { renderSkills(_skillsData); return; }
   const box = $('skillsList');
   try {
-    const data = await api('/api/skills');
+    const [data, optionalData] = await Promise.all([
+      api('/api/skills'),
+      api('/api/skills/optional'),
+    ]);
     _skillsData = data.skills || [];
+    _optionalSkillsData = (optionalData.skills || []).filter(skill => !skill.installed);
+    if(!_optionalSkillsCollapsedInitialized){
+      _collapsedCats.add('Available to install');
+      _optionalSkillsCollapsedInitialized=true;
+    }
     // Prune collapsed state to only keep categories present in fresh data,
     // avoiding stale keys when categories are renamed or removed server-side.
     const liveCats = new Set(_skillsData.map(s => s.category || '(general)'));
@@ -5277,6 +5290,12 @@ function renderSkills(skills) {
     (s.description||'').toLowerCase().includes(query) ||
     (s.category||'').toLowerCase().includes(query)
   ) : skills;
+  const optional = (_optionalSkillsData || []).filter(s => !query ||
+    (s.name||'').toLowerCase().includes(query) ||
+    (s.description||'').toLowerCase().includes(query) ||
+    (s.category||'').toLowerCase().includes(query) ||
+    (s.identifier||'').toLowerCase().includes(query)
+  );
   // Group by category
   const cats = {};
   for (const s of filtered) {
@@ -5286,7 +5305,7 @@ function renderSkills(skills) {
   }
   const box = $('skillsList');
   box.innerHTML = '';
-  if (!filtered.length) { box.innerHTML = `<div style="padding:12px;color:var(--muted);font-size:12px">${esc(t('skills_no_match'))}</div>`; return; }
+  if (!filtered.length && !optional.length) { box.innerHTML = `<div style="padding:12px;color:var(--muted);font-size:12px">${esc(t('skills_no_match'))}</div>`; return; }
   for (const [cat, items] of Object.entries(cats).sort()) {
     const collapsed = _collapsedCats.has(cat);
     const sec = document.createElement('div');
@@ -5321,10 +5340,66 @@ function renderSkills(skills) {
     }
     box.appendChild(sec);
   }
+  if(optional.length){
+    const cat='Available to install';
+    const collapsed=query ? false : _collapsedCats.has(cat);
+    const sec=document.createElement('div');
+    sec.className='skills-category skills-optional-category'+(collapsed?' collapsed':'');
+    const hdr=document.createElement('div');
+    hdr.className='skills-cat-header';
+    hdr.dataset.cat=cat;
+    hdr.innerHTML=`<span class="cat-chevron" style="display:inline-flex;transition:transform .15s;${collapsed?'':'transform:rotate(90deg)'}">${li('chevron-right',12)}</span> ${esc(cat)} <span style="opacity:.5">(${optional.length})</span>`;
+    hdr.onclick=()=>_toggleCatCollapse(cat);
+    sec.appendChild(hdr);
+    for(const skill of optional.sort((a,b)=>a.name.localeCompare(b.name))){
+      const el=document.createElement('div');
+      el.className='skill-item skill-optional-item';
+      el.style.display=collapsed?'none':'';
+      const nameEl=document.createElement('span');
+      nameEl.className='skill-name';
+      nameEl.textContent=skill.name;
+      const descEl=document.createElement('span');
+      descEl.className='skill-desc';
+      descEl.textContent=`${skill.category||'general'} · ${skill.description||''}`;
+      const installBtn=document.createElement('button');
+      installBtn.type='button';
+      installBtn.className='skill-install-btn';
+      installBtn.textContent='Install';
+      installBtn.title=`Install ${skill.name}`;
+      installBtn.onclick=ev=>{
+        ev.stopPropagation();
+        installOptionalSkill(skill,installBtn);
+      };
+      el.append(nameEl,descEl,installBtn);
+      sec.appendChild(el);
+    }
+    box.appendChild(sec);
+  }
 }
 
 function filterSkills() {
   if (_skillsData) renderSkills(_skillsData);
+}
+
+async function installOptionalSkill(skill,button){
+  if(!skill||!skill.identifier) return;
+  if(button){button.disabled=true;button.textContent='Installing…';}
+  try{
+    await api('/api/skills/install-optional',{
+      method:'POST',
+      body:JSON.stringify({identifier:skill.identifier}),
+    });
+    _skillsData=null;
+    _optionalSkillsData=null;
+    _cronSkillsCache=null;
+    if(typeof window!=='undefined'&&typeof window.invalidateSlashSkillCaches==='function') window.invalidateSlashSkillCaches();
+    await loadSkills();
+    showToast(`${skill.name} installed`);
+    await openSkill(skill.name,null);
+  }catch(e){
+    if(button){button.disabled=false;button.textContent='Install';}
+    setStatus(`Install failed: ${e.message}`);
+  }
 }
 
 
@@ -5356,6 +5431,48 @@ let _currentSkillDetail = null; // { name, category, content }
 let _skillMode = 'empty'; // 'empty' | 'read' | 'create' | 'edit'
 let _skillPreFormDetail = null; // snapshot of previously-viewed skill when entering a form
 let _editingSkillName = null;
+let _pluginSkillOrigin = null; // { pluginKey, pluginName, skillName }
+let _pluginSkillHistoryArmed = false;
+
+function _clearPluginSkillOrigin(){
+  _pluginSkillOrigin=null;
+  if(_pluginSkillHistoryArmed && typeof history!=='undefined' && history.state&&history.state.hermesPluginSkill){
+    const nextState={...history.state};
+    delete nextState.hermesPluginSkill;
+    history.replaceState(nextState,'',window.location.href);
+  }
+  _pluginSkillHistoryArmed=false;
+}
+
+async function _returnToPluginFromSkill(){
+  const origin=_pluginSkillOrigin;
+  if(!origin) return;
+  _pluginSkillOrigin=null;
+  _pluginSkillHistoryArmed=false;
+  await switchPanel('settings');
+  switchSettingsSection('plugins',{skipLazyLoad:true});
+  await loadPluginsPanel();
+  const card=[...document.querySelectorAll('.plugin-card')].find(el=>el.dataset.plugin===origin.pluginKey);
+  if(card){
+    card.classList.add('plugin-card-return-target');
+    requestAnimationFrame(()=>card.scrollIntoView({block:'center',behavior:'smooth'}));
+    setTimeout(()=>card.classList.remove('plugin-card-return-target'),1400);
+  }
+}
+
+function backToPluginFromSkill(){
+  if(_pluginSkillHistoryArmed && typeof history!=='undefined' && history.state&&history.state.hermesPluginSkill){
+    history.back();
+    return;
+  }
+  _returnToPluginFromSkill();
+}
+
+if(typeof window!=='undefined'){
+  window.addEventListener('popstate',()=>{
+    if(_pluginSkillOrigin) _returnToPluginFromSkill();
+  });
+}
 
 function _stripYamlFrontmatter(content) {
   if (!content) return { frontmatter: null, body: '' };
@@ -5386,6 +5503,9 @@ function _renderSkillDetail(name, content, linkedFiles) {
   if (title) title.textContent = name;
   const { frontmatter, body: markdownBody } = _stripYamlFrontmatter(content);
   let html = '';
+  if(_pluginSkillOrigin&&_pluginSkillOrigin.skillName===name){
+    html += `<button type="button" class="skill-plugin-back" aria-label="Back to ${esc(_pluginSkillOrigin.pluginName)}" onclick="backToPluginFromSkill()">&larr; ${esc(_pluginSkillOrigin.pluginName)}</button>`;
+  }
   if (frontmatter) {
     html += `<details class="skill-frontmatter"><summary>${esc(t('skill_metadata'))}</summary><pre><code>${esc(frontmatter)}</code></pre></details>`;
   }
@@ -5437,12 +5557,23 @@ function _setSkillHeaderButtons(mode) {
   const saveBtn = $('btnSaveSkillDetail');
   const show = b => b && (b.style.display = '');
   const hide = b => b && (b.style.display = 'none');
-  if (mode === 'read') { if (header) header.style.display = 'flex';  show(editBtn); show(delBtn); hide(cancelBtn); hide(saveBtn); }
+  if (mode === 'read') {
+    if (header) header.style.display = 'flex';
+    if(_currentSkillDetail&&_currentSkillDetail.pluginSkill){
+      if(_currentSkillDetail.editable) show(editBtn); else hide(editBtn);
+      hide(delBtn);
+    }else{
+      show(editBtn); show(delBtn);
+    }
+    hide(cancelBtn); hide(saveBtn);
+  }
   else if (mode === 'create' || mode === 'edit') { if (header) header.style.display = 'flex'; hide(editBtn); hide(delBtn); show(cancelBtn); show(saveBtn); }
   else { if (header) header.style.display = 'none';  hide(editBtn); hide(delBtn); hide(cancelBtn); hide(saveBtn); }
 }
 
-async function openSkill(name, el) {
+async function openSkill(name, el, options) {
+  options=options||{};
+  if(!options.fromPluginCard) _clearPluginSkillOrigin();
   // Highlight active skill in the sidebar list
   document.querySelectorAll('.skill-item').forEach(e => e.classList.remove('active'));
   if (el) el.classList.add('active');
@@ -5456,10 +5587,33 @@ async function openSkill(name, el) {
       setStatus(t('skill_load_failed') + message);
       return;
     }
-    _currentSkillDetail = { name, content: data.content || '', linked_files: data.linked_files || {} };
+    _currentSkillDetail = {
+      name,
+      content: data.content || '',
+      linked_files: data.linked_files || {},
+      pluginSkill: !!data.plugin_skill || name.includes(':'),
+      editable: data.editable !== false,
+    };
     _renderSkillDetail(name, data.content || '', data.linked_files || {});
     _closeMobileSidebarAfterPanelSelection();
   } catch(e) { setStatus(t('skill_load_failed') + e.message); }
+}
+
+async function openPluginSkillFromCard(plugin, qualifiedName){
+  const pluginKey=String((plugin&&plugin.key)||(plugin&&plugin.name)||'');
+  const pluginName=String((plugin&&plugin.name)||pluginKey||'Plugin');
+  _pluginSkillOrigin={pluginKey,pluginName,skillName:qualifiedName};
+  if(typeof history!=='undefined'){
+    const nextState={...(history.state||{}),hermesPluginSkill:true};
+    history.pushState(nextState,'',window.location.href);
+    _pluginSkillHistoryArmed=true;
+  }
+  if(typeof switchPanel==='function') await switchPanel('skills');
+  await openSkill(qualifiedName,null,{fromPluginCard:true});
+  // Plugin skills are canonical and cannot be deleted from the Skills panel;
+  // user/project plugin skills may edit their registered SKILL.md in place.
+  const delBtn=$('btnDeleteSkillDetail');
+  if(delBtn) delBtn.style.display='none';
 }
 
 async function openSkillFile(skillName, filePath) {
@@ -5505,15 +5659,16 @@ async function openSkillFile(skillName, filePath) {
 function editCurrentSkill() {
   if (!_currentSkillDetail) return;
   const s = _currentSkillDetail;
+  if(s.pluginSkill&&!s.editable) return;
   let category = '';
   if (_skillsData) {
     const match = _skillsData.find(x => x.name === s.name);
     if (match) category = match.category || '';
   }
-  _skillPreFormDetail = { name: s.name, content: s.content, linked_files: s.linked_files };
+  _skillPreFormDetail = { ...s };
   _editingSkillName = s.name;
   _skillMode = 'edit';
-  _renderSkillForm({ name: s.name, category, content: s.content || '', isEdit: true });
+  _renderSkillForm({ name: s.name, category, content: s.content || '', isEdit: true, isPluginSkill: !!s.pluginSkill });
 }
 
 function openSkillCreate() {
@@ -5528,7 +5683,7 @@ function openSkillCreate() {
   _closeMobileSidebarAfterPanelSelection();
 }
 
-function _renderSkillForm({ name, category, content, isEdit }) {
+function _renderSkillForm({ name, category, content, isEdit, isPluginSkill=false }) {
   const title = $('skillDetailTitle');
   const body = $('skillDetailBody');
   const empty = $('skillDetailEmpty');
@@ -5539,12 +5694,12 @@ function _renderSkillForm({ name, category, content, isEdit }) {
   body.innerHTML = `
     <div class="main-view-content">
       <form class="detail-form" onsubmit="event.preventDefault(); saveSkillForm();">
-        <div class="detail-form-row">
+        <div class="detail-form-row" ${isPluginSkill?'style="display:none"':''}>
           <label for="skillFormName">${esc(t('skill_name') || 'Name')}</label>
           <input type="text" id="skillFormName" value="${esc(name || '')}" placeholder="my-skill" autocomplete="off" ${nameDisabled} required>
           ${nameHint}
         </div>
-        <div class="detail-form-row">
+        <div class="detail-form-row" ${isPluginSkill?'style="display:none"':''}>
           <label for="skillFormCategory">${esc(t('skill_category') || 'Category')}</label>
           <input type="text" id="skillFormCategory" value="${esc(category || '')}" placeholder="${esc(t('skill_category_placeholder') || 'Optional, e.g. devops')}" autocomplete="off">
         </div>
@@ -5558,7 +5713,7 @@ function _renderSkillForm({ name, category, content, isEdit }) {
   body.style.display = '';
   if (empty) empty.style.display = 'none';
   _setSkillHeaderButtons(isEdit ? 'edit' : 'create');
-  const focusEl = isEdit ? $('skillFormCategory') : $('skillFormName');
+  const focusEl = isPluginSkill ? $('skillFormContent') : (isEdit ? $('skillFormCategory') : $('skillFormName'));
   if (focusEl) focusEl.focus();
 }
 
@@ -5593,6 +5748,7 @@ async function saveSkillForm() {
   const name = (nameInput.value || '').trim().toLowerCase().replace(/\s+/g, '-');
   const category = (catInput ? (catInput.value || '').trim() : '');
   const content = contentInput.value;
+  const editingPluginSkill=!!(_currentSkillDetail&&_currentSkillDetail.pluginSkill);
   errEl.style.display = 'none';
   if (!name) { errEl.textContent = t('skill_name_required'); errEl.style.display = ''; return; }
   if (!content.trim()) { errEl.textContent = t('content_required'); errEl.style.display = ''; return; }
@@ -5604,6 +5760,10 @@ async function saveSkillForm() {
     if(typeof window!=='undefined'&&typeof window.invalidateSlashSkillCaches==='function') window.invalidateSlashSkillCaches();
     _editingSkillName = null;
     _skillPreFormDetail = null;
+    if(editingPluginSkill){
+      await openSkill(name,null,{fromPluginCard:!!_pluginSkillOrigin});
+      return;
+    }
     await loadSkills();
     // Reload the saved skill in read mode with fresh content
     const row = document.querySelector(`.skill-item .skill-name`);
@@ -11534,10 +11694,13 @@ function _partitionPluginsActiveFirst(plugins){
   return active.concat(inactive);
 }
 
-async function loadPluginsPanel(){
+async function loadPluginsPanel(options={}){
   const list=$('pluginsList');
   const empty=$('pluginsEmpty');
   if(!list) return;
+  const focusPluginKey=options&&typeof options.focusPluginKey==='string'
+    ? options.focusPluginKey
+    : '';
   try{
     const data=await api('/api/plugins');
     const plugins=Array.isArray((data||{}).plugins)?data.plugins:[];
@@ -11554,6 +11717,18 @@ async function loadPluginsPanel(){
     list.style.display='';
     for(const plugin of _partitionPluginsActiveFirst(plugins)){
       list.appendChild(_buildPluginCard(plugin));
+    }
+    if(focusPluginKey){
+      const focusCard=Array.from(list.children).find(el=>el.dataset&&el.dataset.plugin===focusPluginKey);
+      const reveal=()=>{
+        if(focusCard&&typeof focusCard.scrollIntoView==='function'){
+          focusCard.scrollIntoView({block:'center',inline:'nearest'});
+        }else if(typeof window!=='undefined'&&typeof window.scrollTo==='function'){
+          window.scrollTo({top:0,left:0});
+        }
+      };
+      if(typeof requestAnimationFrame==='function') requestAnimationFrame(reveal);
+      else reveal();
     }
   }catch(e){
     list.innerHTML='<div style="color:var(--error);padding:12px;font-size:13px">'+t('plugins_load_failed')+esc(e.message||String(e))+'</div>';
@@ -11579,6 +11754,26 @@ function _buildPluginCard(plugin){
   const hookHtml=hooks.length
     ? hooks.map(h=>`<span class="plugin-hook-badge">${esc(h)}</span>`).join('')
     : '<span class="plugin-hook-empty">'+t(isProvider?'plugins_provider_no_hooks':'plugins_no_hooks')+'</span>';
+  const skills=Array.isArray(plugin&&plugin.skills)?plugin.skills:[];
+  const skillsHtml=skills.length
+    ? `<div class="provider-card-label plugin-skills-label">${t('cron_skills_label')}</div>
+       <div class="plugin-skill-list">${skills.map(skill=>{
+         const name=skill&&skill.name?String(skill.name):'';
+         const qualified=skill&&skill.qualified_name?String(skill.qualified_name):'';
+         const actions=[];
+         if(skill&&skill.customizable&&!skill.customized) actions.push(`<button type="button" class="plugin-skill-action" data-skill-action="customize" data-qualified-skill="${esc(qualified)}" title="Customize skill" aria-label="Customize ${esc(name)}">✎</button>`);
+         if(skill&&skill.customized) actions.push(`<button type="button" class="plugin-skill-action" data-skill-action="reset" data-qualified-skill="${esc(qualified)}" title="Restore plugin original" aria-label="Restore original ${esc(name)}">↺</button>`);
+         if(skill&&skill.disabled) actions.push(`<button type="button" class="plugin-skill-action" data-skill-action="restore" data-qualified-skill="${esc(qualified)}" title="Restore skill" aria-label="Restore ${esc(name)}">↺</button>`);
+         else if(skill&&skill.removable) actions.push(`<button type="button" class="plugin-skill-action plugin-skill-action-danger" data-skill-action="delete" data-qualified-skill="${esc(qualified)}" title="Permanently delete skill" aria-label="Delete ${esc(name)}">×</button>`);
+         else actions.push(`<button type="button" class="plugin-skill-action" data-skill-action="disable" data-qualified-skill="${esc(qualified)}" title="Disable skill" aria-label="Disable ${esc(name)}">⊘</button>`);
+         const chipClass=`plugin-skill-chip${skill&&skill.disabled?' is-disabled':''}${skill&&skill.inactive?' is-plugin-inactive':''}${skill&&skill.customized?' is-customized':''}`;
+         const stateTitle=skill&&skill.disabled?'Disabled':(skill&&skill.inactive?'Inactive while plugin is disabled':(skill&&skill.customized?'Customized':''));
+         const badgeTitle=skill&&skill.inactive?`${qualified} — Inactive while plugin is disabled`:qualified;
+         return name&&qualified
+           ? `<div class="${chipClass}"${stateTitle?` data-state="${stateTitle}"`:''}><button type="button" class="plugin-skill-badge" data-qualified-skill="${esc(qualified)}" title="${esc(badgeTitle)}">${esc(name)}</button>${actions.join('')}</div>`
+           : '';
+       }).join('')}</div>`
+    : '';
   const version=(plugin&&plugin.version)?' · v'+esc(plugin.version):'';
   const desc=(plugin&&plugin.description)?esc(plugin.description):t('plugins_no_description');
 const enabled=plugin&&plugin.enabled!==false;
@@ -11623,18 +11818,29 @@ const enabled=plugin&&plugin.enabled!==false;
     badgeText=t('plugins_disabled');
     badgeClass='plugin-card-badge-disabled';
   }
+  const headerActions=!isDashboardPlugin&&plugin&&plugin.can_disable
+    ? `<div class="plugin-header-actions">
+         <label class="plugin-lifecycle-toggle" title="${activation==='disabled'?'Enable plugin':'Disable plugin'}">
+           <input type="checkbox" class="plugin-lifecycle-toggle-input" ${activation==='disabled'?'':'checked'}>
+           <span class="plugin-lifecycle-toggle-track" aria-hidden="true"></span>
+           <span class="plugin-lifecycle-toggle-text">${activation==='disabled'?'Disabled':'Enabled'}</span>
+         </label>
+         ${plugin.can_uninstall?'<button type="button" class="plugin-uninstall-btn" data-plugin-action="uninstall">Uninstall</button>':''}
+       </div>`
+    : `<span class="provider-card-badge ${badgeClass}">${badgeText}</span>`;
   card.innerHTML=`
     <div class="provider-card-header plugin-card-header">
       <div class="provider-card-info">
         <div class="provider-card-name">${esc((plugin&&plugin.name)||t('plugins_unnamed'))}</div>
         <div class="provider-card-meta">${esc((plugin&&plugin.key)||'plugin')}${version}</div>
       </div>
-      <span class="provider-card-badge ${badgeClass}">${badgeText}</span>
+      ${headerActions}
     </div>
     <div class="provider-card-body plugin-card-body">
       <div class="provider-card-hint">${desc}</div>
       <div class="provider-card-label">${t('plugins_registered_hooks')}</div>
       <div class="plugin-hook-list">${hookHtml}</div>
+      ${skillsHtml}
       ${openBtn ? `<div class="plugin-card-footer">${openBtn}</div>` : ''}
       ${toggleHtml}
     </div>
@@ -11655,7 +11861,79 @@ const enabled=plugin&&plugin.enabled!==false;
       _tog.addEventListener('change', function(){ handlePluginEnableToggle(_k, this.checked); });
     }
   }
+  if(skills.length){
+    card.querySelectorAll('.plugin-skill-badge').forEach(skillEl=>{
+      skillEl.addEventListener('click', async function(){
+        const qualified=this.dataset.qualifiedSkill;
+        if(!qualified) return;
+        await openPluginSkillFromCard(plugin,qualified);
+      });
+    });
+    card.querySelectorAll('.plugin-skill-action').forEach(actionEl=>{
+      actionEl.addEventListener('click',async function(ev){
+        ev.preventDefault(); ev.stopPropagation();
+        await handlePluginSkillLifecycle(this.dataset.qualifiedSkill,this.dataset.skillAction);
+      });
+    });
+  }
+  const lifecycleToggle=card.querySelector('.plugin-lifecycle-toggle-input');
+  if(lifecycleToggle){
+    lifecycleToggle.addEventListener('change',async function(){
+      const requestedChecked=this.checked;
+      const requested=requestedChecked?'enable':'disable';
+      // Keep the rendered state authoritative until the server accepts the change.
+      // loadPluginsPanel() will replace the control with the confirmed state on success.
+      this.checked=!requestedChecked;
+      this.disabled=true;
+      const ok=await handlePluginLifecycle(plugin,requested);
+      if(!ok){
+        this.checked=!requestedChecked;
+        this.disabled=false;
+      }
+    });
+  }
+  card.querySelectorAll('.plugin-uninstall-btn').forEach(actionEl=>{
+    actionEl.addEventListener('click',async function(){
+      await handlePluginLifecycle(plugin,this.dataset.pluginAction);
+    });
+  });
   return card;
+}
+
+async function handlePluginSkillLifecycle(name,action){
+  if(!name||!action) return;
+  if(action==='delete'){
+    const confirmed=await showConfirmDialog({title:'Delete skill?',message:`Permanently delete ${name}? This removes its source files and cannot be undone.`,confirmLabel:'Delete',danger:true,focusCancel:true});
+    if(!confirmed) return;
+  }
+  if(action==='reset'){
+    const confirmed=await showConfirmDialog({title:'Restore plugin original?',message:`Discard the customization for ${name} and restore the plugin original?`,confirmLabel:'Restore',danger:true,focusCancel:true});
+    if(!confirmed) return;
+  }
+  try{
+    const result=await api('/api/plugins/skill/action',{method:'POST',body:JSON.stringify({name,action})});
+    if(!result||!result.ok) throw new Error((result&&result.error)||'Plugin skill action failed');
+    if(typeof window!=='undefined'&&typeof window.invalidateSlashSkillCaches==='function') window.invalidateSlashSkillCaches();
+    await loadPluginsPanel({focusPluginKey:name.split(':',1)[0]});
+    setStatus(action==='customize'?`${name} is ready to edit.`:`${name} updated.`);
+  }catch(e){ setStatus(`Plugin skill update failed: ${e.message||e}`); }
+}
+
+async function handlePluginLifecycle(plugin,action){
+  const key=plugin&&plugin.key;
+  if(!key||!action) return false;
+  if(action==='uninstall'){
+    const confirmed=await showConfirmDialog({title:'Uninstall plugin?',message:`Uninstall ${plugin.name||key}? A recoverable copy will be kept in the Hermes plugin trash.`,confirmLabel:'Uninstall',danger:true,focusCancel:true});
+    if(!confirmed) return false;
+  }
+  try{
+    const result=await api('/api/plugins/action',{method:'POST',body:JSON.stringify({key,action})});
+    if(!result||!result.ok) throw new Error((result&&result.error)||'Plugin action failed');
+    if(typeof window!=='undefined'&&typeof window.invalidateSlashSkillCaches==='function') window.invalidateSlashSkillCaches();
+    await loadPluginsPanel({focusPluginKey:key});
+    setStatus(`${plugin.name||key} ${action==='enable'?'enabled':action==='disable'?'disabled':'uninstalled'}.`);
+    return true;
+  }catch(e){ setStatus(`Plugin update failed: ${e.message||e}`); return false; }
 }
 
 // ── Plugin pages ─────────────────────────────────────────────────────────────
@@ -12738,9 +13016,9 @@ function _updateAuthWarningBadge(authStatus){
   badges.forEach(function(id){
     const el=$(id);
     if(!el) return;
-    if(!authDisabled){ el.style.display='none'; return; }
+    if(!authDisabled||acknowledged){ el.style.display='none'; return; }
     el.style.display='block';
-    el.style.background=acknowledged?'#e8a030':'#e05';
+    el.style.background='#e05';
   });
 }
 
@@ -14296,12 +14574,165 @@ async function _gatewayAction(action){
     await loadGatewayStatus();
   }
 }
+function loadGmailWatcherStatus(){
+  const card=$('gmailWatcherStatusCard');
+  if(!card) return;
+  api('/api/gmail-watcher/status').then(r=>{
+    if(!r) return;
+    const configured=!!r.configured;
+    const running=!!r.running;
+    const schedulerRunning=!!r.scheduler_running;
+    const state=configured?(r.state||(running?'scheduled':'paused')):'missing';
+    const schedule=r.schedule?esc(String(r.schedule)):'not scheduled';
+    const deliver=r.deliver?esc(String(r.deliver)):'not configured';
+    const lastRun=r.last_run_at?esc(new Date(r.last_run_at).toLocaleString()):'never';
+    const nextRun=r.next_run_at?esc(new Date(r.next_run_at).toLocaleString()):'not scheduled';
+    const lastStatus=r.last_status?esc(String(r.last_status)):'none';
+    const completed=(r.completed!==null&&r.completed!==undefined)?esc(String(r.completed)):'0';
+    const gatewayNote=schedulerRunning?'Gateway scheduler running':'Gateway is stopped; watcher will not fire automatically';
+    const errorBits=[r.last_error,r.last_delivery_error].filter(Boolean).map(x=>String(x)).join('\n');
+    const alerts=Array.isArray(r.recent_alerts)?r.recent_alerts:[];
+    const recentAlerts=alerts.length?`<div class="gateway-recent-alerts">
+      <div class="gateway-recent-alerts-title">Recent matched email${alerts.length!==1?'s':''}</div>
+      ${alerts.map(a=>`<pre class="gateway-status-output">${esc(String(a.content||''))}</pre>`).join('')}
+    </div>`:'';
+    const logTail=(r.log_tail&&r.log_tail.length)?`<details class="gateway-log-details"><summary>Recent watcher log</summary><pre>${esc(r.log_tail.join('\n'))}</pre></details>`:'';
+    const hint=(!configured&&r.hint)?`<pre class="gateway-status-output">${esc(r.hint)}</pre>`:'';
+    card.innerHTML=`
+      <div class="gateway-status-panel">
+        <div class="gateway-status-head">
+          <div>
+            <div class="gateway-state-line">
+              <span class="gateway-dot ${running?'running':'stopped'}"></span>
+              <span class="${running?'gateway-running':'gateway-stopped'}">${esc(state)}</span>
+            </div>
+            <div class="gateway-meta">${esc(gatewayNote)} · ${schedule}</div>
+          </div>
+          <div class="gateway-actions">
+            <button type="button" class="btn-tiny" onclick="gmailWatcherControl('start')" ${(!configured||running)?'disabled':''}>Start</button>
+            <button type="button" class="btn-tiny" onclick="gmailWatcherControl('stop')" ${(!configured||!running)?'disabled':''}>Stop</button>
+            <button type="button" class="btn-tiny" onclick="gmailWatcherControl('run')" ${configured?'':'disabled'}>Run now</button>
+            <button type="button" class="btn-tiny" onclick="openGmailWatcherSession()" ${r.webui_session_id?'':'disabled'}>Open session</button>
+            <button type="button" class="btn-tiny" onclick="loadGmailWatcherStatus()">Refresh</button>
+          </div>
+        </div>
+        <div class="gateway-session-meta">
+          <span>Deliver: ${deliver}</span>
+          <span>Seen: ${esc(String(r.seen_count||0))}</span>
+          <span>Runs: ${completed}</span>
+        </div>
+        <div class="gateway-session-meta">
+          <span>Last run: ${lastRun}</span>
+          <span>Next run: ${nextRun}</span>
+          <span>Status: ${lastStatus}</span>
+        </div>
+        <div class="gateway-command">Config: <code>${esc(r.config_path||'')}</code></div>
+        ${errorBits?`<pre class="gateway-status-output">${esc(errorBits)}</pre>`:''}
+        ${recentAlerts}
+        ${hint}
+        ${logTail}
+      </div>`;
+  }).catch(()=>{card.innerHTML=`<div style="color:#ef4444;font-size:12px">Failed to load Gmail watcher status</div>`});
+}
+async function openGmailWatcherSession(){
+  try{
+    if(typeof switchPanel==='function') await switchPanel('chat');
+    if(typeof renderSessionList==='function') await renderSessionList();
+    if(typeof loadSession==='function') await loadSession('gmail_keyword_watcher');
+  }catch(e){
+    showToast(`Open Gmail watcher session failed: ${e.message||e}`,5000);
+  }
+}
+async function gmailWatcherControl(action){
+  const card=$('gmailWatcherStatusCard');
+  const label=action==='run'?'Run now':(action.charAt(0).toUpperCase()+action.slice(1));
+  try{
+    if(card) card.classList.add('gateway-busy');
+    const res=await api(`/api/gmail-watcher/${encodeURIComponent(action)}`,{method:'POST',body:'{}'});
+    if(res&&res.ok===false){
+      showToast(`Gmail watcher ${label.toLowerCase()} failed`,4000);
+    }else{
+      showToast(`Gmail watcher ${label.toLowerCase()} complete`,2500);
+    }
+  }catch(e){
+    showToast(`Gmail watcher ${label.toLowerCase()} failed: ${e.message||e}`,5000);
+  }finally{
+    if(card) card.classList.remove('gateway-busy');
+    loadGmailWatcherStatus();
+  }
+}
+function _gmailWatcherAlertKey(alert){
+  if(!alert) return '';
+  const ts=alert.timestamp!==undefined&&alert.timestamp!==null?String(alert.timestamp):'';
+  const content=String(alert.content||'');
+  return ts+'|'+content.slice(0,200);
+}
+function _showGmailWatcherNotification(alert){
+  const existing=$('gmailWatcherNotice');
+  if(existing) existing.remove();
+  const content=String((alert&&alert.content)||'');
+  const lines=content.split('\n').map(s=>s.trim()).filter(Boolean);
+  const subject=(lines.find(line=>line.toLowerCase().startsWith('subject:'))||'New matched Gmail').replace(/^Subject:\s*/i,'');
+  const from=(lines.find(line=>line.toLowerCase().startsWith('from:'))||'').replace(/^From:\s*/i,'');
+  const notice=document.createElement('div');
+  notice.id='gmailWatcherNotice';
+  notice.className='gmail-watcher-notice';
+  notice.innerHTML=`
+    <div class="gmail-watcher-notice-main">
+      <div class="gmail-watcher-notice-title">New Gmail watcher match</div>
+      <div class="gmail-watcher-notice-sub">${esc(subject)}${from?` · ${esc(from)}`:''}</div>
+    </div>
+    <div class="gmail-watcher-notice-actions">
+      <button type="button" class="btn-tiny" id="gmailWatcherNoticeOpen">Open</button>
+      <button type="button" class="btn-tiny" id="gmailWatcherNoticeDismiss">Dismiss</button>
+    </div>`;
+  document.body.appendChild(notice);
+  const open=$('gmailWatcherNoticeOpen');
+  const dismiss=$('gmailWatcherNoticeDismiss');
+  if(open) open.onclick=async()=>{notice.remove();await openGmailWatcherSession();};
+  if(dismiss) dismiss.onclick=()=>notice.remove();
+  setTimeout(()=>{if(document.body.contains(notice)) notice.remove();},30000);
+  if(typeof showToast==='function') showToast('New Gmail watcher match — open from the notification',4500,'info');
+  if(typeof sendBrowserNotification==='function'){
+    try{sendBrowserNotification('New Gmail watcher match', subject+(from?` · ${from}`:''));}catch(_){}
+  }
+}
+async function pollGmailWatcherNotifications(){
+  try{
+    const status=await api('/api/gmail-watcher/status');
+    const alerts=Array.isArray(status&&status.recent_alerts)?status.recent_alerts:[];
+    const latest=alerts[0];
+    const key=_gmailWatcherAlertKey(latest);
+    if(!key) return;
+    if(!_gmailWatcherLastAlertKey){
+      _gmailWatcherLastAlertKey=key;
+      localStorage.setItem('hermes-gmail-watcher-last-alert',key);
+      return;
+    }
+    if(key&&key!==_gmailWatcherLastAlertKey){
+      _gmailWatcherLastAlertKey=key;
+      localStorage.setItem('hermes-gmail-watcher-last-alert',key);
+      if(typeof renderSessionList==='function') renderSessionList();
+      if(S&&S.session&&S.session.session_id==='gmail_keyword_watcher'&&typeof loadSession==='function'){
+        loadSession('gmail_keyword_watcher');
+      }else{
+        _showGmailWatcherNotification(latest);
+      }
+    }
+  }catch(_){/* notification polling should stay quiet */}
+}
+function startGmailWatcherNotificationPolling(){
+  if(_gmailWatcherNotifyTimer) return;
+  pollGmailWatcherNotifications();
+  _gmailWatcherNotifyTimer=setInterval(pollGmailWatcherNotifications,20000);
+}
+startGmailWatcherNotificationPolling();
 // Load MCP servers when system settings tab opens
 const _origSwitchSettings=switchSettingsSection;
 switchSettingsSection=function(name, opts){
   _origSwitchSettings(name, opts);
   if(name==='preferences') updateNotificationPermissionStatus();
-  if(name==='system'){loadMcpServers();loadMcpTools();loadGatewayStatus();}
+  if(name==='system'){loadMcpServers();loadMcpTools();loadGatewayStatus();loadGmailWatcherStatus();}
 };
 
 // ── Checkpoints / Rollback ──────────────────────────────────────────────────

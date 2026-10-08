@@ -36,7 +36,7 @@ from api.config import (
     LOCK, STREAMS, STREAMS_LOCK, DEFAULT_WORKSPACE, DEFAULT_MODEL, PROJECTS_FILE, HOME,
     get_effective_default_model, _get_session_agent_lock,
 )
-from api.workspace import get_last_workspace, _resolve_path, profile_home_resolve_cache_scope
+from api.workspace import get_last_workspace, get_neutral_default_workspace, _resolve_path, profile_home_resolve_cache_scope
 from api.usage import prompt_cache_hit_percent
 from api.agent_sessions import (
     _is_continuation_session,
@@ -6986,7 +6986,7 @@ def new_session(workspace=None, model=None, profile=None, model_provider=None, p
     wt = worktree_info if isinstance(worktree_info, dict) else None
     workspace_path = (wt.get('path') if wt and wt.get('path') else workspace) if wt else workspace
     s = Session(
-        workspace=workspace_path or get_last_workspace(profile=profile),
+        workspace=workspace_path or get_neutral_default_workspace(),
         model=effective_model,
         model_provider=effective_model_provider,
         profile=profile,

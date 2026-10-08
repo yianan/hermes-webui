@@ -10299,6 +10299,34 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                     except socket.gaierror:
                         pass
 
+                # LM Studio's OpenAI-compatible /v1/models includes embedding
+                # models. Its native endpoint identifies model types, so use it
+                # for the chat picker when this named provider is LM Studio.
+                if "lm-studio" in provider or "lmstudio" in provider:
+                    native_base = base.rstrip("/")
+                    if native_base.endswith("/v1"):
+                        native_base = native_base[:-3]
+                    native_url = native_base.rstrip("/") + "/api/v1/models"
+                    try:
+                        native_req = urllib.request.Request(native_url, method="GET")
+                        native_req.add_header("User-Agent", "OpenAI/Python 1.0")
+                        for header_name, header_value in headers.items():
+                            native_req.add_header(header_name, header_value)
+                        with urllib.request.urlopen(native_req, timeout=CUSTOM_MODELS_ENDPOINT_TIMEOUT_SECONDS) as response:
+                            native_data = json.loads(response.read().decode("utf-8"))
+                        native_models = native_data.get("models", []) if isinstance(native_data, dict) else []
+                        if isinstance(native_models, list):
+                            llms = [
+                                {"id": str(model.get("key")), "label": str(model.get("display_name") or model.get("key"))}
+                                for model in native_models
+                                if isinstance(model, dict)
+                                and model.get("type") == "llm"
+                                and model.get("key")
+                            ]
+                            return llms, None
+                    except Exception:
+                        logger.debug("LM Studio native model discovery failed at %s", native_url)
+
                 probe_key = _custom_endpoint_probe_key(endpoint_url, headers)
                 memoized = _custom_endpoint_probe_memo.get(probe_key)
                 if memoized is not None:

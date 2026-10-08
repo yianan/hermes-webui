@@ -3826,6 +3826,16 @@ document.addEventListener('click', e => {
     }
     return;
   }
+  const revealFolderLink=e.target.closest('a.msg-folder-reveal-link[href^="#reveal-folder="]');
+  if(revealFolderLink){
+    e.preventDefault();
+    const href=revealFolderLink.getAttribute('href')||'';
+    let targetPath='';
+    try{targetPath=decodeURIComponent(href.slice('#reveal-folder='.length));}
+    catch(_){targetPath=href.slice('#reveal-folder='.length);}
+    void revealLinkedFolder(targetPath);
+    return;
+  }
   const workspaceLink=e.target.closest('a[href^="#workspace="]');
   if(workspaceLink){
     e.preventDefault();
@@ -3851,6 +3861,35 @@ document.addEventListener('click', e => {
     return;
   }
 });
+
+async function revealLinkedFolder(targetPath){
+  if(!S||!S.session||!S.session.session_id){
+    if(typeof showToast==='function') showToast(t('no_active_session')||'No active session',3000,'error');
+    return;
+  }
+  const raw=String(targetPath||'').trim();
+  if(!raw){
+    if(typeof showToast==='function') showToast(t('reveal_failed')+'Missing path',3000,'error');
+    return;
+  }
+  const workspace=String(S.session.workspace||'').replace(/\/+$/,'');
+  let rel=raw.replace(/^~\//,'').replace(/^\.\//,'');
+  if(workspace){
+    const normalized=raw.replace(/\/+$/,'');
+    if(normalized===workspace) rel='.';
+    else if(normalized.startsWith(workspace+'/')) rel=normalized.slice(workspace.length+1);
+  }
+  if(raw.startsWith('/')&&workspace&&!((raw.replace(/\/+$/,'')===workspace)||raw.startsWith(workspace+'/'))){
+    if(typeof showToast==='function') showToast(t('reveal_failed')+'Folder is outside the active workspace',5000,'error');
+    return;
+  }
+  if(!rel) rel='.';
+  try{
+    await api('/api/file/reveal',{method:'POST',body:JSON.stringify({session_id:S.session.session_id,path:rel})});
+  }catch(err){
+    if(typeof showToast==='function') showToast(t('reveal_failed')+(err.message||err),5000,'error');
+  }
+}
 
 const _IMAGE_EXTS=/\.(png|jpg|jpeg|gif|webp|bmp|ico|avif)$/i;
 const _PDF_EXTS=/\.pdf$/i;
@@ -10674,6 +10713,18 @@ function renderMd(raw){
     }
     return href;
   }
+  function _fileHrefPath(raw){
+    const href=String(raw||'');
+    try{
+      const url=new URL(href);
+      if(/^file:$/i.test(url.protocol)) return decodeURIComponent(url.pathname||'');
+    }catch(_){}
+    try{return decodeURIComponent(href.replace(/^file:\/\//i,''));}
+    catch(_){return href.replace(/^file:\/\//i,'');}
+  }
+  function _isDirectoryFileHref(raw){
+    return /^file:\/\//i.test(String(raw||'')) && /\/(?:[?#].*)?$/.test(String(raw||''));
+  }
   function _isInternalSessionHref(raw){
     const href=String(raw||'').trim();
     if(/^session\/[^?#]+/i.test(href)) return true;
@@ -10704,6 +10755,10 @@ function renderMd(raw){
     return esc(tokenized).replace(/\x00H(\d+)\x00/g,(_,i)=>_label_stash[+i]);
   }
   function _markdownAnchor(label,rawUrl){
+    if(_isDirectoryFileHref(rawUrl)){
+      const path=_fileHrefPath(rawUrl);
+      return `<a class="msg-folder-reveal-link" href="#reveal-folder=${encodeURIComponent(path)}">${_markdownLabelHtml(label)}</a>`;
+    }
     const href=_markdownHref(rawUrl);
     const internal=/^session:\/\//i.test(String(rawUrl||'')) || _isInternalSessionHref(href);
     return `<a${internal?' class="session-link"':''} href="${href}"${internal?'':' target="_blank" rel="noopener"'}>${_markdownLabelHtml(label)}</a>`;
@@ -10767,7 +10822,7 @@ function renderMd(raw){
       if(!_isSafeUrl(a.href,false)) return '<a>';
       const target=a.target==='_blank'?' target="_blank"':'';
       const rel=a.rel==='noopener'?' rel="noopener"':'';
-      const cls=_cls(a.class,['msg-media-link','skill-linked-file','skill-file-back','session-link']);
+      const cls=_cls(a.class,['msg-media-link','skill-linked-file','skill-file-back','session-link','msg-folder-reveal-link']);
       const download=a.download?` download="${esc(a.download)}"`:'';
       // #7941: keep the blocked-remote-image tooltip only on a media chip whose
       // href really is a non-allowlisted remote image AND whose title begins with
@@ -11717,8 +11772,10 @@ function copyMsg(btn){
 function _copyThinkingText(btn){
   const card=btn&&btn.closest?btn.closest('.thinking-card'):null;
   if(!card)return;
-  const pre=card.querySelector('.thinking-card-body pre');
-  const text=pre?pre.textContent:'';
+  const body=card.querySelector('.thinking-card-body');
+  const text=(body&&body.dataset&&body.dataset.thinkingRaw)
+    ? body.dataset.thinkingRaw
+    : (body?body.textContent:'');
   if(!text)return;
   _copyText(text).then(()=>{
     const orig=btn.innerHTML;
@@ -15472,7 +15529,7 @@ function _thinkingCardHtml(text, open){
   const copyBtn=`<button class="thinking-copy-btn" onclick="event.stopPropagation();_copyThinkingText(this)" title="${t('copy')}" aria-label="${t('copy')}">${li('copy',12)}</button>`;
   const shouldOpen=!!open||_worklogDetailsExpandedDefault();
   const classes=`thinking-card${shouldOpen?' open':''}`;
-  return `<div class="${classes}"><div class="thinking-card-header" onclick="_toggleThinkingCard(this.parentElement)"><span class="thinking-card-icon">${li('lightbulb',14)}</span><span class="thinking-card-label">${t('thinking')}</span><span class="thinking-card-btn-row">${copyBtn}<span class="thinking-card-toggle">${li('chevron-right',12)}</span></span></div><div class="thinking-card-body"><pre>${esc(clean)}</pre></div></div>`;
+  return `<div class="${classes}"><div class="thinking-card-header" onclick="_toggleThinkingCard(this.parentElement)"><span class="thinking-card-icon">${li('lightbulb',14)}</span><span class="thinking-card-label">${t('thinking')}</span><span class="thinking-card-btn-row">${copyBtn}<span class="thinking-card-toggle">${li('chevron-right',12)}</span></span></div>${_thinkingBodyHtml(clean)}</div>`;
 }
 function isSimplifiedToolCalling(){
   return window._simplifiedToolCalling!==false;
@@ -15713,8 +15770,13 @@ function _copyEventToClipboard(row,control){
     }
     text=parts.join('\n');
   }else if(type==='thinking'){
-    const pre=row.querySelector('.thinking-card-body pre');
-    text=pre?pre.textContent:(row.textContent||'').replace(/^\s*Thinking\s*/i,'');
+    const body=row.querySelector('.thinking-card-body');
+    if(body){
+      const hasRaw=body.dataset&&Object.prototype.hasOwnProperty.call(body.dataset,'thinkingRaw');
+      text=hasRaw?body.dataset.thinkingRaw:(body.textContent||'');
+    }else{
+      text=(row.textContent||'').replace(/^\s*Thinking\s*/i,'');
+    }
     label='thinking';
   }else{
     text=row.textContent||'';
@@ -16239,7 +16301,35 @@ function _decorateTransparentEventRow(row, opts){
       const label=header.querySelector('.thinking-card-label');
       if(label) label.textContent='Thinking';
       let preview=header.querySelector('.transparent-event-preview,.transparent-event-thinking-preview');
-      const previewText=_transparentEventPreview(opts.preview||opts.text||row.textContent||'');
+      const rawPreview=_transparentEventPreview(opts.preview||opts.text||row.textContent||'');
+      let previewText=rawPreview;
+      let previewHtml='';
+      if(rawPreview&&typeof renderMd==='function'&&typeof document!=='undefined'){
+        const previewSource=document.createElement('div');
+        previewSource.innerHTML=renderMd(rawPreview);
+        previewText=_transparentEventPreview(previewSource.textContent||rawPreview);
+        const inlinePreview=document.createElement('span');
+        const blockTags=new Set(['P','DIV','UL','OL','LI','BLOCKQUOTE','TABLE','THEAD','TBODY','TFOOT','TR','TD','TH','PRE','H1','H2','H3','H4','H5','H6']);
+        const appendInline=(node)=>{
+          if(!node) return;
+          if(node.nodeType===3){
+            inlinePreview.appendChild(document.createTextNode(node.textContent||''));
+            return;
+          }
+          if(node.nodeType!==1) return;
+          const tag=String(node.tagName||'').toUpperCase();
+          if(tag==='BR'){
+            inlinePreview.appendChild(document.createTextNode(' '));
+          }else if(blockTags.has(tag)){
+            Array.from(node.childNodes||[]).forEach(appendInline);
+            inlinePreview.appendChild(document.createTextNode(' '));
+          }else{
+            inlinePreview.appendChild(node.cloneNode(true));
+          }
+        };
+        Array.from(previewSource.childNodes||[]).forEach(appendInline);
+        previewHtml=inlinePreview.innerHTML.trim();
+      }
       if(previewText){
         if(!preview){
           preview=document.createElement('span');
@@ -16249,7 +16339,9 @@ function _decorateTransparentEventRow(row, opts){
           else header.appendChild(preview);
         }
         preview.classList.add('transparent-event-thinking-preview');
-        preview.textContent=previewText;
+        if(previewHtml) preview.innerHTML=previewHtml;
+        else preview.textContent=previewText;
+        preview.title=previewText;
       }else if(preview){
         preview.remove();
       }
@@ -17735,26 +17827,12 @@ function _refreshTransparentThinkingLiveRow(existing, node){
   const existingIsThinking = existingType === 'thinking' || (existing.classList&&existing.classList.contains('transparent-thinking-event'));
   const nodeIsThinking = nodeType === 'thinking' || (node.classList&&node.classList.contains('transparent-thinking-event'));
   if(!existingIsThinking || !nodeIsThinking) return false;
-  const existingPre = existing.querySelector('.thinking-card-body pre');
-  const nodePre = node.querySelector('.thinking-card-body pre');
-  if(!existingPre || !nodePre) return false;
-  const thinkingBody = existingPre.closest ? existingPre.closest('.thinking-card-body') : null;
-  // Same tail-follow rule as _renderThinkingInto: only LIVE, OPEN thinking
-  // rows may seed the follow latch or move their body to the tail (a
-  // collapsed body's tail read would force a layout per delta).
-  const thinkingLive = typeof _thinkingRowIsLive==='function'?_thinkingRowIsLive(existing):true;
-  const thinkingCard = thinkingBody&&thinkingBody.closest?thinkingBody.closest('.thinking-card'):null;
-  const thinkingOpen = !thinkingCard||(thinkingCard.classList&&thinkingCard.classList.contains('open'));
-  // A body still running its open animation is excluded: seeding or pinning
-  // inside that window yanks a reader holding at the top (#7988 review).
-  const thinkingSettling = !!(thinkingBody&&thinkingBody._thinkingTailSettling);
-  if(thinkingBody&&thinkingLive&&thinkingOpen&&!thinkingSettling&&typeof _bindThinkingTailFollow==='function') _bindThinkingTailFollow(thinkingBody);
-  const thinkingFollow = thinkingBody&&thinkingLive&&thinkingOpen&&!thinkingSettling&&thinkingBody._thinkingTailFollow===true;
-  const nextText = String(nodePre.textContent || '');
-  if(existingPre.textContent !== nextText){
-    existingPre.textContent = nextText;
-    if(thinkingFollow) thinkingBody.scrollTop=Math.max(0,(Number(thinkingBody.scrollHeight)||0)-(Number(thinkingBody.clientHeight)||0));
-  }
+  const existingBody = existing.querySelector('.thinking-card-body');
+  const nodeBody = node.querySelector('.thinking-card-body');
+  if(!existingBody || !nodeBody) return false;
+  const nextText = String((nodeBody.dataset&&nodeBody.dataset.thinkingRaw)||nodeBody.textContent||'');
+  const existingText = String((existingBody.dataset&&existingBody.dataset.thinkingRaw)||existingBody.textContent||'');
+  if(existingText !== nextText) _renderThinkingInto(existing, nextText);
   const nodePreview = node.querySelector('.transparent-event-thinking-preview');
   const previewText = nodePreview ? String(nodePreview.textContent || '') : nextText;
   if(typeof _decorateTransparentEventRow === 'function'){
@@ -25027,8 +25105,13 @@ function _thinkingMarkup(text=''){
   const clean=_sanitizeThinkingDisplayText(text);
   const openClass=_worklogDetailsExpandedDefault()?' open':'';
   return (clean&&String(clean).trim())
-    ? `<div class="thinking-card${openClass}"><div class="thinking-card-header" onclick="_toggleThinkingCard(this.parentElement)"><span class="thinking-card-icon">${li('lightbulb',14)}</span><span class="thinking-card-label">${t('thinking')}</span><span class="thinking-card-toggle">${li('chevron-right',12)}</span></div><div class="thinking-card-body"><pre>${esc(String(clean).trim())}</pre></div></div>`
+    ? `<div class="thinking-card${openClass}"><div class="thinking-card-header" onclick="_toggleThinkingCard(this.parentElement)"><span class="thinking-card-icon">${li('lightbulb',14)}</span><span class="thinking-card-label">${t('thinking')}</span><span class="thinking-card-toggle">${li('chevron-right',12)}</span></div>${_thinkingBodyHtml(String(clean).trim())}</div>`
     : `<div class="thinking"><div class="dot"></div><div class="dot"></div><div class="dot"></div></div>`;
+}
+function _thinkingBodyHtml(clean){
+  const raw=String(clean||'');
+  const rendered=(typeof renderMd==='function')?renderMd(raw):esc(raw);
+  return `<div class="thinking-card-body" data-thinking-raw="${esc(raw)}"><div class="thinking-markdown">${rendered}</div></div>`;
 }
 function _renderThinkingInto(row,text=''){
   if(!row) return;
@@ -25037,9 +25120,9 @@ function _renderThinkingInto(row,text=''){
     row.innerHTML=_thinkingMarkup(text);
     return;
   }
-  const pre=row.querySelector('.thinking-card-body pre');
-  if(pre){
-    const body=pre.closest?pre.closest('.thinking-card-body'):null;
+  const body=row.querySelector('.thinking-card-body');
+  const markdown=body&&body.querySelector('.thinking-markdown');
+  if(body&&markdown){
     // Tail-follow applies to LIVE thinking rows only. A settled card (or any
     // body whose reader has scrolled up) keeps its scroll position: a creation
     // write must never seed the follow latch or the next rebuild would jump a
@@ -25056,8 +25139,9 @@ function _renderThinkingInto(row,text=''){
     const settling=!!(body&&body._thinkingTailSettling);
     if(body&&live&&open&&!settling&&typeof _bindThinkingTailFollow==='function') _bindThinkingTailFollow(body);
     const follow=body&&live&&open&&!settling&&body._thinkingTailFollow===true;
-    const changed=pre.textContent!==clean;
-    pre.textContent=clean;
+    const changed=body.dataset.thinkingRaw!==clean;
+    body.dataset.thinkingRaw=clean;
+    if(changed) markdown.innerHTML=(typeof renderMd==='function')?renderMd(clean):esc(clean);
     if(follow&&changed) body.scrollTop=Math.max(0,(Number(body.scrollHeight)||0)-(Number(body.clientHeight)||0));
     return;
   }

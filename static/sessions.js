@@ -2389,24 +2389,19 @@ async function newSession(flash, options={}){
       }
     }
     // Project-bound workspace (quick-create with bindings) wins first,
-    // then explicit profile-switch, then current conversation, then profile default.
-    // Provenance lets the server recover only a deleted inherited path; explicit paths stay strict.
+    // then an explicit one-shot profile/workspace switch. Otherwise the server
+    // selects the neutral configured default; explicit paths stay strict.
     const switchWs=S._profileSwitchWorkspace;
     S._profileSwitchWorkspace=null;
-    const sessionWs=(!switchWs&&S.session)?S.session.workspace:null;
     const boundWs=(options&&options.workspace)||null;
-    const inheritWs=boundWs||switchWs||sessionWs||(S._profileDefaultWorkspace||null);
+    const inheritWs=boundWs||switchWs||null;
     const reqBody={
-      workspace:inheritWs,
       profile:S.activeProfile||'default',
     };
+    // Generic New Chat uses the server's neutral default, never the previous chat's workspace.
+    if(inheritWs) reqBody.workspace=inheritWs;
     if(S.session&&S.session.session_id){
       reqBody.prev_session_id=S.session.session_id;
-      // Provenance flag ONLY when the workspace actually came from the previous
-      // session: the server uses it to RECOVER a deleted inherited path from the
-      // last workspace, so flagging an explicit project-bound path let a project
-      // chat silently open elsewhere (Greptile P1 2026-10-10T05:08:54Z).
-      if(sessionWs&&!boundWs) reqBody.workspace_inherited_from_prev_session=true;
     }
     // Three-value worktree contract (#6022): explicit true/false is forwarded
     // verbatim; an ABSENT key lets the server apply the agent's config-level
@@ -3528,7 +3523,17 @@ async function loadSession(sid){
   }
 
   // Clear the in-flight session marker now that this load has completed (#1060).
-  if (_isCurrentLoad()) _loadingSessionId = null;
+  // A zero-message session deliberately keeps the loading placeholder while
+  // the marker is set (renderMessages() guard above). Re-render once after the
+  // marker clears so a newly-created conversation opened by URL shows the
+  // empty composer instead of remaining on "Loading conversation..." forever.
+  if (_isCurrentLoad()) {
+    _loadingSessionId = null;
+    if (S.session && S.session.session_id === sid && S.messages.length === 0 &&
+        typeof renderMessages === 'function') {
+      renderMessages(sameSessionForceReload ? {preserveScroll:true} : undefined);
+    }
+  }
 
   // Re-acknowledge the visit after the async message-load gap. A deferred
   // sidebar /api/sessions poll can land while _ensureMessagesLoaded is in

@@ -1130,6 +1130,109 @@ def _active_skills_dir() -> Path:
             return Path(os.getenv("HERMES_HOME", str(Path.home() / ".hermes"))).expanduser() / "skills"
 
 
+def _optional_skills_root() -> Path | None:
+    """Return the local hermes-agent optional-skills catalog, when present."""
+    candidates = []
+    configured = os.getenv("HERMES_WEBUI_AGENT_DIR", "").strip()
+    if configured:
+        candidates.append(Path(configured).expanduser())
+    # Normal side-by-side installation: ~/.hermes/hermes-webui and
+    # ~/.hermes/hermes-agent.
+    candidates.append(Path(__file__).resolve().parents[2] / "hermes-agent")
+    candidates.append(Path.home() / ".hermes" / "hermes-agent")
+    for agent_root in candidates:
+        catalog = agent_root / "optional-skills"
+        if catalog.is_dir() and not catalog.is_symlink():
+            return catalog.resolve()
+    return None
+
+
+def _optional_skills_list() -> list[dict]:
+    """List official optional skills shipped on disk but not necessarily active."""
+    from agent.skill_utils import iter_skill_index_files
+    from tools.skills_tool import _EXCLUDED_SKILL_DIRS, _parse_frontmatter, skill_matches_platform
+
+    root = _optional_skills_root()
+    if root is None:
+        return []
+    installed = {
+        str(skill.get("name") or "")
+        for skill in _skills_list_from_dir(_active_skills_dir()).get("skills", [])
+    }
+    available = []
+    for skill_md in iter_skill_index_files(root, "SKILL.md"):
+        if any(part in _EXCLUDED_SKILL_DIRS for part in skill_md.parts):
+            continue
+        try:
+            relative_dir = skill_md.parent.resolve().relative_to(root)
+            if not relative_dir.parts:
+                continue
+            content = skill_md.read_text(encoding="utf-8")[:4000]
+            frontmatter, body = _parse_frontmatter(content)
+            if not skill_matches_platform(frontmatter):
+                continue
+            name = str(frontmatter.get("name") or skill_md.parent.name).strip()[:64]
+            if not name:
+                continue
+            description = str(frontmatter.get("description") or "").strip()
+            if not description:
+                description = next(
+                    (line.strip() for line in body.splitlines() if line.strip() and not line.lstrip().startswith("#")),
+                    "",
+                )
+            available.append({
+                "name": name,
+                "description": description[:240],
+                "category": "/".join(relative_dir.parts[:-1]) or "(general)",
+                "identifier": "official/" + "/".join(relative_dir.parts),
+                "installed": name in installed,
+            })
+        except (OSError, UnicodeDecodeError, ValueError):
+            continue
+    return sorted(available, key=lambda item: (item["category"], item["name"]))
+
+
+def _handle_optional_skill_install(handler, body):
+    """Activate one trusted on-disk optional skill in the active profile."""
+    import re as _re
+    import shutil
+
+    identifier = str(body.get("identifier") or "").strip()
+    if not _re.fullmatch(r"official/[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*", identifier):
+        return bad(handler, "Invalid official skill identifier", 400)
+    root = _optional_skills_root()
+    if root is None:
+        return bad(handler, "Optional skills catalog is unavailable", 404)
+    relative = Path(*identifier.split("/")[1:])
+    source = (root / relative).resolve()
+    try:
+        source.relative_to(root)
+    except ValueError:
+        return bad(handler, "Invalid official skill identifier", 400)
+    if not source.is_dir() or not (source / "SKILL.md").is_file() or source.is_symlink():
+        return bad(handler, "Official skill not found", 404)
+    if any(path.is_symlink() for path in source.rglob("*")):
+        return bad(handler, "Official skill contains an unsupported symlink", 400)
+
+    target = (_active_skills_dir() / relative).resolve()
+    skills_root = _active_skills_dir().resolve()
+    try:
+        target.relative_to(skills_root)
+    except ValueError:
+        return bad(handler, "Invalid installation path", 400)
+    if target.exists():
+        return bad(handler, "Skill is already installed", 409)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(source, target)
+    _SKILLS_STATS_CACHE.clear()
+    return j(handler, {
+        "ok": True,
+        "name": target.name,
+        "identifier": identifier,
+        "category": "/".join(relative.parts[:-1]),
+    })
+
+
 def _skill_path_within(base_dir: Path, candidate: Path) -> bool:
     try:
         candidate.resolve().relative_to(base_dir.resolve())
@@ -1581,13 +1684,83 @@ def _skill_view_from_active_dir(name: str) -> dict:
                 if is_valid_namespace(namespace):
                     discover_plugins()
                     pm = get_plugin_manager()
-                    if pm.find_plugin_skill(name) is not None or pm.list_plugin_skills(namespace):
-                        raw = _skill_view(name)
-                        return json.loads(raw) if isinstance(raw, str) else raw
+                    get_info = getattr(pm, "get_plugin_skill_info", None)
+                    info = get_info(name) if callable(get_info) else None
+                    runtime_path = pm.find_plugin_skill(name)
+                    if info or runtime_path is not None or pm.list_plugin_skills(namespace):
+                        if info and (info.get("disabled") or runtime_path is None):
+                            effective = Path(info["effective_path"])
+                            data = _skill_view_from_file(effective.parent, effective)
+                        else:
+                            raw = _skill_view(name)
+                            data = json.loads(raw) if isinstance(raw, str) else raw
+                        if isinstance(data, dict):
+                            data["plugin_skill"] = True
+                            data["editable"] = _plugin_skill_edit_target(name) is not None
+                            if info:
+                                data["customized"] = bool(info.get("customized"))
+                                data["disabled"] = bool(info.get("disabled"))
+                        return data
             except Exception:
                 pass
         return _skill_not_found_payload(name, skills_dir)
     return _skill_view_from_file(skill_dir, skill_md)
+
+
+def _plugin_skill_edit_target(qualified_name: str) -> Path | None:
+    """Return an editable plugin-owned SKILL.md path, or ``None``.
+
+    Only user/project plugins are editable. The registered skill path must be a
+    regular, non-symlinked ``SKILL.md`` contained by that plugin's manifest
+    directory, so a third-party registration cannot turn this endpoint into an
+    arbitrary file writer.
+    """
+    if ":" not in str(qualified_name or ""):
+        return None
+    try:
+        from agent.skill_utils import is_valid_namespace, parse_qualified_name
+        from hermes_cli.plugins import discover_plugins, get_plugin_manager
+
+        namespace, _bare = parse_qualified_name(qualified_name)
+        if not is_valid_namespace(namespace):
+            return None
+        discover_plugins()
+        manager = get_plugin_manager()
+        get_info = getattr(manager, "get_plugin_skill_info", None)
+        info = get_info(qualified_name) if callable(get_info) else None
+        target = info.get("effective_path") if info else manager.find_plugin_skill(qualified_name)
+        if target is None:
+            return None
+        target_path = Path(target).expanduser()
+        if info and info.get("customized"):
+            from api.profiles import get_active_hermes_home
+            override_root = (get_active_hermes_home() / "plugin-skill-overrides").resolve()
+            if target_path.is_symlink() or target_path.name != "SKILL.md" or not target_path.is_file():
+                return None
+            resolved_target = target_path.resolve()
+            resolved_target.relative_to(override_root)
+            return resolved_target
+        loaded = next(
+            (
+                item for item in (getattr(manager, "_plugins", {}) or {}).values()
+                if getattr(getattr(item, "manifest", None), "name", None) == namespace
+            ),
+            None,
+        )
+        manifest = getattr(loaded, "manifest", None)
+        if manifest is None or getattr(manifest, "source", "") not in {"user", "project"}:
+            return None
+        plugin_root_raw = getattr(manifest, "path", None)
+        if not plugin_root_raw:
+            return None
+        plugin_root = Path(plugin_root_raw).expanduser().resolve()
+        if target_path.is_symlink() or target_path.name != "SKILL.md" or not target_path.is_file():
+            return None
+        resolved_target = target_path.resolve()
+        resolved_target.relative_to(plugin_root)
+        return resolved_target
+    except (OSError, ValueError, TypeError):
+        return None
 
 # ── SSE app-level heartbeat (#1623) ────────────────────────────────────────
 #
@@ -15227,6 +15400,41 @@ def _plugin_visibility_payload(manager=None) -> dict:
             if hook_name in _PLUGIN_VISIBILITY_HOOK_SET and hook_name not in registered:
                 registered.append(hook_name)
         registered.sort(key=_PLUGIN_VISIBILITY_HOOKS.index)
+        registered_skills = []
+        list_plugin_skill_info = getattr(manager, "list_plugin_skill_info", None)
+        list_plugin_skills = getattr(manager, "list_plugin_skills", None)
+        if callable(list_plugin_skill_info):
+            try:
+                for skill_info in list_plugin_skill_info(name):
+                    skill_name = skill_info.get("bare_name", "")
+                    clean_name = _clean_plugin_visibility_text(skill_name, limit=120)
+                    if not clean_name:
+                        continue
+                    registered_skills.append({
+                        "name": clean_name,
+                        "qualified_name": f"{name}:{clean_name}",
+                        "editable": skill_info.get("source") in {"user", "project"} or bool(skill_info.get("customized")),
+                        "customizable": skill_info.get("source") not in {"user", "project"},
+                        "customized": bool(skill_info.get("customized")),
+                        "disabled": bool(skill_info.get("disabled")),
+                        "inactive": not enabled_flag,
+                        "removable": skill_info.get("source") in {"user", "project"},
+                    })
+            except Exception:
+                # Plugin metadata visibility must remain available even if a
+                # third-party manager cannot enumerate its skill registry.
+                registered_skills = []
+        elif callable(list_plugin_skills):
+            try:
+                for skill_name in list_plugin_skills(name):
+                    clean_name = _clean_plugin_visibility_text(skill_name, limit=120)
+                    if clean_name:
+                        registered_skills.append({
+                            "name": clean_name,
+                            "qualified_name": f"{name}:{clean_name}",
+                        })
+            except Exception:
+                registered_skills = []
         plugin_payload = {
             "name": name,
             "key": plugin_key or name,
@@ -15238,7 +15446,11 @@ def _plugin_visibility_payload(manager=None) -> dict:
             "kind": kind,
             "activation": activation,
             "hooks": registered,
+            "can_disable": kind not in {"exclusive", "model-provider"},
+            "can_uninstall": getattr(manifest, "source", "") == "user",
         }
+        if registered_skills:
+            plugin_payload["skills"] = registered_skills
         if include_active_provider:
             plugin_payload["is_active_provider"] = bool(is_active_provider)
         plugins.append(plugin_payload)
@@ -15298,6 +15510,247 @@ def _handle_plugins(handler, parsed) -> bool:
                 "unavailable": True,
             },
         )
+
+
+def _set_plugin_skill_enabled_in_active_config(qualified_name: str, enabled: bool) -> None:
+    config_path = _active_profile_config_path()
+    with _cfg_lock:
+        cfg = _load_yaml_config_file(config_path)
+        plugins_cfg = cfg.setdefault("plugins", {})
+        disabled = _normalize_names_list(plugins_cfg.get("disabled_skills"))
+        plugins_cfg["disabled_skills"] = _toggle_name_in_list(
+            disabled, qualified_name, enabled
+        )
+        _save_yaml_config_file(config_path, cfg)
+    reload_config()
+
+
+def _delete_user_plugin_skill(manager, info: dict, qualified_name: str) -> None:
+    """Permanently delete a conventional user/project plugin skill safely."""
+    if info.get("source") not in {"user", "project"}:
+        raise PermissionError("Only user and project plugin skills can be deleted")
+    plugin_name, skill_name = qualified_name.split(":", 1)
+    plugin_root_raw = info.get("plugin_path")
+    if not plugin_root_raw:
+        raise ValueError("Plugin does not expose a managed source directory")
+    plugin_root = Path(plugin_root_raw).expanduser().resolve()
+    original = Path(info.get("original_path") or "").expanduser()
+    expected_dir = (plugin_root / "skills" / skill_name).resolve()
+    if (
+        original.name != "SKILL.md"
+        or original.is_symlink()
+        or not original.is_file()
+        or original.parent.is_symlink()
+        or original.parent.resolve() != expected_dir
+    ):
+        raise PermissionError("Plugin skill source is not safe to delete")
+
+    manifest_file = next(
+        (path for path in (plugin_root / "plugin.yaml", plugin_root / "plugin.yml") if path.is_file() and not path.is_symlink()),
+        None,
+    )
+    if manifest_file is None:
+        raise ValueError("Plugin manifest is missing")
+    import yaml
+
+    manifest_text = manifest_file.read_text(encoding="utf-8")
+    manifest_data = yaml.safe_load(manifest_text) or {}
+    declared = manifest_data.get("provides_skills") if isinstance(manifest_data, dict) else None
+    if not isinstance(declared, list) or skill_name not in declared:
+        raise ValueError("Skill is not managed by the plugin manifest")
+
+    lines = manifest_text.splitlines(keepends=True)
+    header_index = next(
+        (i for i, line in enumerate(lines) if re.match(r"^\s*provides_skills\s*:\s*(?:#.*)?$", line.rstrip("\r\n"))),
+        None,
+    )
+    if header_index is None:
+        raise ValueError("Plugin uses an unsupported skill manifest format")
+    header_indent = len(lines[header_index]) - len(lines[header_index].lstrip())
+    item_pattern = re.compile(
+        r"^\s*-\s*(?:['\"])?" + re.escape(skill_name) + r"(?:['\"])?\s*(?:#.*)?(?:\r?\n)?$"
+    )
+    item_index = None
+    for i in range(header_index + 1, len(lines)):
+        stripped = lines[i].strip()
+        indent = len(lines[i]) - len(lines[i].lstrip())
+        if stripped and not stripped.startswith("#") and indent <= header_indent:
+            break
+        if item_pattern.match(lines[i]):
+            item_index = i
+            break
+    if item_index is None:
+        raise ValueError("Plugin uses an unsupported skill manifest format")
+
+    staged_dir = expected_dir.with_name(f".{expected_dir.name}.deleting-{uuid.uuid4().hex}")
+    expected_dir.rename(staged_dir)
+    try:
+        updated_text = "".join(lines[:item_index] + lines[item_index + 1:])
+        temp_manifest = manifest_file.with_name(f".{manifest_file.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            temp_manifest.write_text(updated_text, encoding="utf-8")
+            os.replace(temp_manifest, manifest_file)
+        finally:
+            if temp_manifest.exists():
+                temp_manifest.unlink()
+    except Exception:
+        staged_dir.rename(expected_dir)
+        raise
+
+    shutil.rmtree(staged_dir)
+    override = Path(info.get("override_path") or "").expanduser()
+    if override.is_file() and not override.is_symlink():
+        override.unlink()
+    _set_plugin_skill_enabled_in_active_config(qualified_name, True)
+    remove_skill = getattr(manager, "remove_plugin_skill", None)
+    if callable(remove_skill):
+        remove_skill(qualified_name)
+    manager.discover_and_load(force=True)
+
+
+def _handle_plugin_skill_lifecycle(handler, body):
+    try:
+        require(body, "name", "action")
+    except ValueError as exc:
+        return bad(handler, str(exc))
+    qualified_name = str(body["name"] or "").strip()
+    action = str(body["action"] or "").strip().lower()
+    if qualified_name.count(":") != 1 or action not in {
+        "customize", "reset", "disable", "enable", "remove", "restore", "delete"
+    }:
+        return bad(handler, "Invalid plugin skill action")
+    try:
+        from hermes_cli.plugins import discover_plugins, get_plugin_manager
+        from api.profiles import get_active_hermes_home
+
+        discover_plugins()
+        manager = get_plugin_manager()
+        get_info = getattr(manager, "get_plugin_skill_info", None)
+        info = get_info(qualified_name) if callable(get_info) else None
+        if not info:
+            return bad(handler, "Plugin skill not found", 404)
+
+        if action == "customize":
+            if info.get("source") in {"user", "project"}:
+                return bad(handler, "This skill can be edited directly", 409)
+            original = Path(info["original_path"])
+            if original.is_symlink() or not original.is_file() or original.name != "SKILL.md":
+                return bad(handler, "Plugin skill source is not safe to customize", 403)
+            plugin_name, skill_name = qualified_name.split(":", 1)
+            override = (
+                get_active_hermes_home()
+                / "plugin-skill-overrides" / plugin_name / skill_name / "SKILL.md"
+            )
+            if override.exists() and override.is_symlink():
+                return bad(handler, "Plugin skill override is not safe to write", 403)
+            override.parent.mkdir(parents=True, exist_ok=True)
+            if not override.exists():
+                override.write_text(original.read_text(encoding="utf-8"), encoding="utf-8")
+            return j(handler, {"ok": True, "name": qualified_name, "customized": True})
+
+        if action == "reset":
+            override = Path(info["override_path"])
+            if override.is_symlink():
+                return bad(handler, "Plugin skill override is not safe to remove", 403)
+            if override.is_file():
+                override.unlink()
+                for parent in (override.parent, override.parent.parent):
+                    try:
+                        parent.rmdir()
+                    except OSError:
+                        break
+            return j(handler, {"ok": True, "name": qualified_name, "customized": False})
+
+        if action == "delete":
+            _delete_user_plugin_skill(manager, info, qualified_name)
+            return j(handler, {"ok": True, "name": qualified_name, "deleted": True})
+
+        # Generic plugin registrations are executable Python, so skill-level
+        # removal is a reversible tombstone instead of source-code rewriting.
+        enabled = action in {"enable", "restore"}
+        _set_plugin_skill_enabled_in_active_config(qualified_name, enabled)
+        return j(handler, {
+            "ok": True,
+            "name": qualified_name,
+            "enabled": enabled,
+            "removed": action == "remove" and not enabled,
+        })
+    except Exception as exc:
+        logger.exception("Plugin skill lifecycle action failed")
+        return bad(handler, _sanitize_error(exc), 500)
+
+
+def _set_plugin_enabled_in_active_config(plugin_key: str, enabled: bool) -> None:
+    config_path = _active_profile_config_path()
+    with _cfg_lock:
+        cfg = _load_yaml_config_file(config_path)
+        plugins_cfg = cfg.setdefault("plugins", {})
+        enabled_names = set(_normalize_names_list(plugins_cfg.get("enabled")))
+        disabled_names = set(_normalize_names_list(plugins_cfg.get("disabled")))
+        bare = plugin_key.rsplit("/", 1)[-1]
+        if enabled:
+            enabled_names.add(plugin_key)
+            disabled_names.discard(plugin_key)
+            disabled_names.discard(bare)
+        else:
+            enabled_names.discard(plugin_key)
+            enabled_names.discard(bare)
+            disabled_names.add(plugin_key)
+        plugins_cfg["enabled"] = sorted(enabled_names)
+        plugins_cfg["disabled"] = sorted(disabled_names)
+        _save_yaml_config_file(config_path, cfg)
+    reload_config()
+
+
+def _handle_plugin_lifecycle(handler, body):
+    try:
+        require(body, "key", "action")
+    except ValueError as exc:
+        return bad(handler, str(exc))
+    plugin_key = str(body["key"] or "").strip()
+    action = str(body["action"] or "").strip().lower()
+    if not plugin_key or ".." in plugin_key or action not in {"enable", "disable", "uninstall"}:
+        return bad(handler, "Invalid plugin action")
+    try:
+        import shutil
+        import datetime
+        from api.profiles import get_active_hermes_home
+
+        manager = _get_plugin_manager_for_visibility()
+        manager.discover_and_load(force=False)
+        loaded = (getattr(manager, "_plugins", {}) or {}).get(plugin_key)
+        if loaded is None:
+            return bad(handler, "Plugin not found", 404)
+        manifest = getattr(loaded, "manifest", None)
+        kind = getattr(manifest, "kind", "standalone")
+        if action in {"enable", "disable"}:
+            if kind in {"exclusive", "model-provider"}:
+                return bad(handler, "This provider is managed in its provider settings", 409)
+            _set_plugin_enabled_in_active_config(plugin_key, action == "enable")
+            manager.discover_and_load(force=True)
+            return j(handler, {"ok": True, "key": plugin_key, "enabled": action == "enable"})
+
+        if getattr(manifest, "source", "") != "user":
+            return bad(handler, "Bundled and project plugins cannot be uninstalled here", 403)
+        target = Path(getattr(manifest, "path", "")).expanduser()
+        plugins_root = (get_active_hermes_home() / "plugins").resolve()
+        if target.is_symlink() or not target.is_dir():
+            return bad(handler, "Plugin directory is not safe to uninstall", 403)
+        resolved = target.resolve()
+        resolved.relative_to(plugins_root)
+        trash_root = get_active_hermes_home() / "plugin-trash"
+        trash_root.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        destination = trash_root / f"{resolved.name}-{stamp}"
+        shutil.move(str(resolved), str(destination))
+        _set_plugin_enabled_in_active_config(plugin_key, False)
+        manager.discover_and_load(force=True)
+        return j(handler, {"ok": True, "key": plugin_key, "uninstalled": True})
+    except (OSError, ValueError) as exc:
+        return bad(handler, _sanitize_error(exc), 400)
+    except Exception as exc:
+        logger.exception("Plugin lifecycle action failed")
+        return bad(handler, _sanitize_error(exc), 500)
 
 
 _SHELL_ERROR_HTML = """<!doctype html>
@@ -15453,6 +15906,26 @@ def _save_saved_prompts(prompts: list) -> None:
     p.write_text(json.dumps(prompts, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _webui_asset_version_token() -> str:
+    """Return a cache token that changes when locally patched shell assets change."""
+    from urllib.parse import quote
+    from api.updates import WEBUI_VERSION
+
+    static_root = api_config.get_static_root()
+    newest_mtime = 0
+    for name in (
+        "index.html", "style.css", "i18n.js", "icons.js", "ui.js",
+        "workspace.js", "terminal.js", "sessions.js", "commands.js",
+        "messages.js", "panels.js", "onboarding.js", "boot.js", "sw.js",
+    ):
+        try:
+            newest_mtime = max(newest_mtime, int((static_root / name).stat().st_mtime))
+        except OSError:
+            pass
+    suffix = f"-local.{newest_mtime}" if newest_mtime else ""
+    return quote(f"{WEBUI_VERSION}{suffix}", safe="")
+
+
 # In-process cache for the app-shell template. The `/`, `/index.html`, and
 # `/session/<id>` routes are the hottest navigations and each re-read the
 # ~190 KB static/index.html from disk and re-ran the two process-constant
@@ -15474,8 +15947,6 @@ def _render_index_shell_base() -> str:
     extension-tag injection are intentionally NOT applied here — they vary per
     request and are applied by the caller against this base string.
     """
-    from api.updates import WEBUI_VERSION
-
     index_path = api_config.get_index_html_path()
     st = index_path.stat()
     sig = (index_path, st.st_size, st.st_mtime_ns)
@@ -15483,9 +15954,7 @@ def _render_index_shell_base() -> str:
         cached = _INDEX_SHELL_CACHE.get("base")
         if cached and cached[0] == sig:
             return cached[1]
-    from urllib.parse import quote
-
-    version_token = quote(WEBUI_VERSION, safe="")
+    version_token = _webui_asset_version_token()
     base = (
         index_path.read_text(encoding="utf-8")
         .replace("__WEBUI_VERSION__", version_token)
@@ -16295,7 +16764,7 @@ def handle_get(handler, parsed) -> bool:
             _password_form_html = _passkey_button_html
         else:
             _password_form_html = ""
-        version_token = quote(WEBUI_VERSION, safe="")
+        version_token = _webui_asset_version_token()
         _page = (
             _LOGIN_PAGE_HTML.replace("{{BOT_NAME}}", _bn)
             .replace("{{BOT_NAME_INITIAL}}", _bn[0].upper())
@@ -16434,9 +16903,7 @@ def handle_get(handler, parsed) -> bool:
         if sw_path.exists():
             # Inject the current git-derived version as the cache name so the
             # service worker cache busts automatically on every new deploy.
-            from urllib.parse import quote
-            from api.updates import WEBUI_VERSION
-            version_token = quote(WEBUI_VERSION, safe="")
+            version_token = _webui_asset_version_token()
             text = sw_path.read_text(encoding="utf-8").replace(
                 "__WEBUI_VERSION__", version_token
             )
@@ -16716,6 +17183,12 @@ def handle_get(handler, parsed) -> bool:
         try:
             from api.updates import AGENT_VERSION, WEBUI_VERSION
             settings["webui_version"] = WEBUI_VERSION
+            # The release version remains stable for display/update logic, while
+            # the bundle token also changes when local shell assets change. The
+            # browser compares this token so a committed local patch does not
+            # look perpetually stale against the unmodified release version.
+            from urllib.parse import unquote
+            settings["webui_bundle_version"] = unquote(_webui_asset_version_token())
             settings["agent_version"] = AGENT_VERSION
         except Exception:
             pass
@@ -17342,6 +17815,9 @@ def handle_get(handler, parsed) -> bool:
         data = _skills_list_from_dir(_active_skills_dir(), category=category)
         return j(handler, {"skills": data.get("skills", [])})
 
+    if parsed.path == "/api/skills/optional":
+        return j(handler, {"skills": _optional_skills_list()})
+
     if parsed.path == "/api/skills/usage":
         from api.skill_usage import read_skill_usage
         raw = read_skill_usage(_active_skills_dir())
@@ -17471,6 +17947,15 @@ def handle_get(handler, parsed) -> bool:
     # ── Gateway Status (GET) ──
     if parsed.path == "/api/gateway/status":
         return j(handler, _gateway_status_payload())
+
+    if parsed.path == "/api/gmail-watcher/status":
+        try:
+            from api.service_control import gmail_watcher_status
+
+            return j(handler, gmail_watcher_status())
+        except Exception as exc:
+            logger.exception("gmail watcher status failed")
+            return bad(handler, str(exc), status=500)
 
     # ── MCP Servers (GET) ──
     if parsed.path == "/api/mcp/servers":
@@ -19847,12 +20332,31 @@ def handle_post(handler, parsed) -> bool:
     if parsed.path == "/api/skills/toggle":
         return _handle_skill_toggle(handler, body)
 
+    if parsed.path == "/api/skills/install-optional":
+        return _handle_optional_skill_install(handler, body)
+
+    if parsed.path == "/api/plugins/skill/action":
+        return _handle_plugin_skill_lifecycle(handler, body)
+
+    if parsed.path == "/api/plugins/action":
+        return _handle_plugin_lifecycle(handler, body)
+
     # ── Memory (POST) ──
     if parsed.path == "/api/memory/write":
         return _handle_memory_write(handler, body)
 
     if parsed.path in {"/api/gateway/start", "/api/gateway/stop", "/api/gateway/restart"}:
         return _handle_gateway_lifecycle(handler, parsed.path.rsplit("/", 1)[-1], body)
+
+    if parsed.path in {"/api/gmail-watcher/start", "/api/gmail-watcher/stop", "/api/gmail-watcher/run"}:
+        try:
+            from api.service_control import gmail_watcher_control
+
+            action = parsed.path.rsplit("/", 1)[-1]
+            return j(handler, gmail_watcher_control(action))
+        except Exception as exc:
+            logger.exception("gmail watcher control failed")
+            return bad(handler, str(exc), status=500)
 
     # ── Profile API (POST) ──
     if parsed.path == "/api/profile/switch":
@@ -25549,14 +26053,15 @@ def _handle_live_models(handler, parsed):
                         import urllib.request
                         import json
                         
-                        # Build the models endpoint URL
-                        # AxonHub and similar OpenAI-compat endpoints serve /v1/models
                         _ep = _base_url.rstrip("/")
-                        # If base_url already ends with /v1, use /models; otherwise add /v1/models
-                        if _ep.endswith("/v1"):
-                            _models_url = f"{_ep}/models"
+                        if "lm-studio" in provider or "lmstudio" in provider:
+                            # The OpenAI-compatible catalog also lists embedding
+                            # models; the native catalog marks chat models as llm.
+                            _native_base = _ep[:-3] if _ep.endswith("/v1") else _ep
+                            _models_url = f"{_native_base.rstrip('/')}/api/v1/models"
                         else:
-                            _models_url = f"{_ep}/v1/models"
+                            # Other OpenAI-compatible providers use /v1/models.
+                            _models_url = f"{_ep}/models" if _ep.endswith("/v1") else f"{_ep}/v1/models"
                         
                         _req = urllib.request.Request(
                             _models_url,
@@ -25566,8 +26071,12 @@ def _handle_live_models(handler, parsed):
                         with urllib.request.urlopen(_req, timeout=CUSTOM_MODELS_ENDPOINT_TIMEOUT_SECONDS) as _resp:
                             _body = json.loads(_resp.read())
                         
-                        # Parse response: {"data": [{"id": "model1", ...}, ...]}
-                        if isinstance(_body, dict):
+                        if ("lm-studio" in provider or "lmstudio" in provider) and isinstance(_body, dict):
+                            _data = _body.get("models", [])
+                            if isinstance(_data, list):
+                                ids = [m["key"] for m in _data if isinstance(m, dict) and m.get("type") == "llm" and m.get("key")]
+                        # OpenAI-compatible response: {"data": [{"id": "model1", ...}, ...]}
+                        elif isinstance(_body, dict):
                             _data = _body.get("data", [])
                             if isinstance(_data, list):
                                 ids = [m.get("id", "") for m in _data if m.get("id")]
@@ -31212,7 +31721,10 @@ def _handle_file_reveal(handler, body):
 
         system = platform.system()
         if system == "Darwin":
-            subprocess.Popen(["open", "-R", target_str])
+            if target.is_dir():
+                subprocess.Popen(["open", target_str])
+            else:
+                subprocess.Popen(["open", "-R", target_str])
         elif system == "Windows":
             subprocess.Popen(["explorer.exe", "/select," + target_str])
         else:
@@ -33580,6 +34092,20 @@ def _handle_skill_save(handler, body):
     category = body.get("category", "").strip()
     if category and ("/" in category or ".." in category):
         return bad(handler, "Invalid category")
+    if ":" in skill_name:
+        if category:
+            return bad(handler, "Plugin skills cannot change category")
+        skill_file = _plugin_skill_edit_target(skill_name)
+        if skill_file is None:
+            return bad(handler, "Plugin skill is not editable", 403)
+        skill_file.write_text(body["content"], encoding="utf-8")
+        _SKILLS_STATS_CACHE.clear()
+        return j(handler, {
+            "ok": True,
+            "name": skill_name,
+            "path": str(skill_file),
+            "plugin_skill": True,
+        })
     skills_dir = _active_skills_dir()
 
     if category:

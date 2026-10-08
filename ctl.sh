@@ -633,13 +633,14 @@ start_cmd() {
   local python_exe pid
   python_exe="$(_find_python)"
   : >> "${LOG_FILE}"
-  (
-    cd "${REPO_ROOT}"
-    trap '' HUP
-    export HERMES_WEBUI_PRESERVE_ENV=1
-    exec nohup "${python_exe}" "${REPO_ROOT}/bootstrap.py" --no-browser --foreground --host "${CTL_HOST}" "${CTL_PORT}" ${CTL_BOOTSTRAP_ARGS[@]+"${CTL_BOOTSTRAP_ARGS[@]}"}
-  ) >> "${LOG_FILE}" 2>&1 &
-  pid=$!
+  # A plain shell background job can still receive a hangup when its invoking
+  # terminal/session closes on macOS. Launch in a fresh process session so the
+  # on-demand WebUI remains alive after ctl.sh returns.
+  pid="$(
+    HERMES_WEBUI_PRESERVE_ENV=1 "${python_exe}" -c \
+      'import os, subprocess, sys; log=open(sys.argv[1], "ab", buffering=0); env=os.environ.copy(); env["HERMES_WEBUI_PRESERVE_ENV"]="1"; p=subprocess.Popen(sys.argv[3:], cwd=sys.argv[2], env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, start_new_session=True); print(p.pid)' \
+      "${LOG_FILE}" "${REPO_ROOT}" "${python_exe}" "${REPO_ROOT}/bootstrap.py" --no-browser --foreground --host "${CTL_HOST}" "${CTL_PORT}" ${CTL_BOOTSTRAP_ARGS[@]+"${CTL_BOOTSTRAP_ARGS[@]}"}
+  )"
 
   printf '%s\n' "${pid}" > "${PID_FILE}"
   _write_state "${pid}" "${CTL_HOST}" "${CTL_PORT}" "${python_exe}"

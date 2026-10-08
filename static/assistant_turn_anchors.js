@@ -1433,6 +1433,17 @@
     return el&&typeof el.textContent==='string'?el.textContent:'';
   }
 
+  function _rendererSnapshotThinkingText(row){
+    if(!row||typeof row.querySelector!=='function') return '';
+    const body=row.querySelector('.thinking-card-body');
+    const raw=body&&body.dataset&&typeof body.dataset.thinkingRaw==='string'?body.dataset.thinkingRaw:'';
+    return _firstTextValue(
+      raw,
+      _rendererSnapshotQueryText(row,'.thinking-markdown'),
+      _rendererSnapshotQueryText(row,'.thinking-card-body pre')
+    );
+  }
+
   function _rendererSnapshotText(row){
     const explicit=_firstTextValue(
       _rendererSnapshotAttr(row,['text']),
@@ -1444,7 +1455,7 @@
     return _firstTextValue(
       _rendererSnapshotQueryText(row,'.transparent-event-preview'),
       _rendererSnapshotQueryText(row,'.transparent-event-thinking-preview'),
-      _rendererSnapshotQueryText(row,'.thinking-card-body pre'),
+      _rendererSnapshotThinkingText(row),
       _rendererSnapshotQueryText(row,'.tool-card-preview'),
       _rendererSnapshotQueryText(row,'.tool-card-result pre'),
       typeof row.textContent==='string'?row.textContent:''

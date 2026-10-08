@@ -41,3 +41,17 @@ class TestRevealPathTranslation:
         assert "target_str" in body
         # Ensure the translation assignment is present
         assert "target_str = host_prefix + target_str[len(container_prefix):]" in body
+
+    def test_macos_opens_directories_and_reveals_files(self):
+        """Directory reveal should open the folder itself; file reveal selects the file."""
+        src = ROUTES.read_text(encoding="utf-8")
+        m = re.search(
+            r"def _handle_file_reveal\(handler, body\):.*?(?=\ndef )",
+            src,
+            re.DOTALL,
+        )
+        assert m
+        body = m.group(0)
+        assert 'if target.is_dir():' in body
+        assert 'subprocess.Popen(["open", target_str])' in body
+        assert 'subprocess.Popen(["open", "-R", target_str])' in body
