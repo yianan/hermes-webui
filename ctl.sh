@@ -166,14 +166,20 @@ _load_hermes_dotenv() {
 _find_python() {
   if [[ -n "${HERMES_WEBUI_PYTHON:-}" ]]; then
     printf '%s\n' "${HERMES_WEBUI_PYTHON}"
-  elif command -v python3 >/dev/null 2>&1; then
-    command -v python3
-  elif command -v python >/dev/null 2>&1; then
-    command -v python
-  else
-    echo "[ctl] Python 3 is required to run bootstrap.py" >&2
-    return 1
+    return 0
   fi
+  # bootstrap imports typed path helpers before it can resolve Agent's PM runtime.
+  # macOS /usr/bin/python3 may still be 3.9, so require a supported bootstrap.
+  local candidate executable
+  for candidate in python3.14 python3.13 python3.12 python3.11 python3 python; do
+    executable="$(command -v "${candidate}" 2>/dev/null || true)"
+    if [[ -n "${executable}" ]] && "${executable}" -c 'import sys; sys.exit(sys.version_info < (3, 11))' 2>/dev/null; then
+      printf '%s\n' "${executable}"
+      return 0
+    fi
+  done
+  echo "[ctl] Python 3.11+ is required to run bootstrap.py" >&2
+  return 1
 }
 
 _parse_launch_binding() {
