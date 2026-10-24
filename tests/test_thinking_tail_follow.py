@@ -185,6 +185,7 @@ global.document={ createElement:tag=>new FakeElement(tag) };
 global.S={ session:{session_id:'sid-1'} };
 global._sanitizeThinkingDisplayText=value=>String(value||'').trim();
 global._thinkingMarkup=()=>'';
+global.renderMd=value=>String(value||'');
 
 const stick=uiSrc.match(/const _THINKING_TAIL_STICK_PX=(\d+)/);
 if(!stick) throw new Error('_THINKING_TAIL_STICK_PX not found in ui.js');
@@ -213,8 +214,10 @@ function makeThinkingRow(text, live=true){
   const body=new FakeElement('div');
   body.className='thinking-card-body';
   body.clientHeight=200;
-  const pre=new FakeElement('pre');
+  const pre=new FakeElement('div');
+  pre.className='thinking-markdown';
   pre.textContent=text;
+  body.dataset.thinkingRaw=text;
   body.appendChild(pre);
   card.appendChild(body);
   row.appendChild(card);

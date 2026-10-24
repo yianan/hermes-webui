@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import errno
+import json
 import os
 import platform
 import shutil
@@ -143,7 +144,43 @@ def discover_agent_dir() -> Path | None:
     return _LAST_DISCOVERY.agent_dir
 
 
+def _managed_agent_python(agent_dir: Path | None) -> str | None:
+    """Read PM's selected interpreter through the installation's own Python.
+
+    PM generations replace the historical in-tree venv. This is metadata-only:
+    never import the Agent or attempt dependency repair while selecting Python.
+    """
+    if agent_dir is None:
+        return None
+    launcher = agent_dir / ".hermes" / "bin" / ("hermes.exe" if os.name == "nt" else "hermes")
+    if not launcher.is_file():
+        return None
+    result = subprocess.run(
+        [str(launcher), "--print-runtime-command"], capture_output=True, text=True, timeout=15, check=True,
+    )
+    command = json.loads(result.stdout)
+    if not isinstance(command, list) or not command or not isinstance(command[0], str):
+        raise RuntimeError("Agent launcher did not identify its managed Python")
+    result = subprocess.run(
+        [command[0], "-I", "-c",
+         "import sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); "
+         "from pm.environments import project_python; print(project_python(Path(sys.argv[1])))",
+         str(agent_dir)],
+        capture_output=True, text=True, timeout=15, check=True,
+    )
+    selected = result.stdout.strip()
+    if not selected or not Path(selected).is_file():
+        raise RuntimeError("Agent's selected managed Python is unavailable")
+    return selected
+
+
 def discover_launcher_python(agent_dir: Path | None) -> str:
+    env_python = os.getenv("HERMES_WEBUI_PYTHON")
+    if env_python:
+        return env_python
+    managed = _managed_agent_python(agent_dir)
+    if managed:
+        return managed
     if (
         agent_dir is not None
         and _LAST_DISCOVERY is not None
@@ -151,9 +188,6 @@ def discover_launcher_python(agent_dir: Path | None) -> str:
         and _LAST_DISCOVERY.python_exe
     ):
         return _LAST_DISCOVERY.python_exe
-    env_python = os.getenv("HERMES_WEBUI_PYTHON")
-    if env_python:
-        return env_python
     if agent_dir:
         for rel in ("venv/bin/python", "venv/Scripts/python.exe", ".venv/bin/python", ".venv/Scripts/python.exe"):
             candidate = agent_dir / rel
@@ -207,6 +241,9 @@ def ensure_python_has_webui_deps(python_exe: str, agent_dir: Path | None = None)
 
     agent_candidates: list[Path] = []
     if agent_dir:
+        managed = _managed_agent_python(agent_dir)
+        if managed:
+            agent_candidates.append(Path(managed))
         for rel in (
             "venv/bin/python",
             "venv/Scripts/python.exe",

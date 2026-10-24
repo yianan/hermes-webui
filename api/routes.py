@@ -15681,24 +15681,13 @@ def _handle_plugin_skill_lifecycle(handler, body):
 
 
 def _set_plugin_enabled_in_active_config(plugin_key: str, enabled: bool) -> None:
-    config_path = _active_profile_config_path()
-    with _cfg_lock:
-        cfg = _load_yaml_config_file(config_path)
-        plugins_cfg = cfg.setdefault("plugins", {})
-        enabled_names = set(_normalize_names_list(plugins_cfg.get("enabled")))
-        disabled_names = set(_normalize_names_list(plugins_cfg.get("disabled")))
-        bare = plugin_key.rsplit("/", 1)[-1]
-        if enabled:
-            enabled_names.add(plugin_key)
-            disabled_names.discard(plugin_key)
-            disabled_names.discard(bare)
-        else:
-            enabled_names.discard(plugin_key)
-            enabled_names.discard(bare)
-            disabled_names.add(plugin_key)
-        plugins_cfg["enabled"] = sorted(enabled_names)
-        plugins_cfg["disabled"] = sorted(disabled_names)
-        _save_yaml_config_file(config_path, cfg)
+    # PM owns dependency admission and the matching enabled-plugin selection.
+    from api.plugin_lifecycle import active_plugin_runtime_scope
+    from hermes_cli.plugins_cmd import dashboard_set_agent_plugin_enabled
+    with active_plugin_runtime_scope():
+        result = dashboard_set_agent_plugin_enabled(plugin_key, enabled=enabled)
+        if not result.get("ok"):
+            raise ValueError(result.get("error") or "Plugin selection was refused")
     reload_config()
 
 
@@ -15712,40 +15701,26 @@ def _handle_plugin_lifecycle(handler, body):
     if not plugin_key or ".." in plugin_key or action not in {"enable", "disable", "uninstall"}:
         return bad(handler, "Invalid plugin action")
     try:
-        import shutil
-        import datetime
-        from api.profiles import get_active_hermes_home
-
-        manager = _get_plugin_manager_for_visibility()
-        manager.discover_and_load(force=False)
-        loaded = (getattr(manager, "_plugins", {}) or {}).get(plugin_key)
-        if loaded is None:
-            return bad(handler, "Plugin not found", 404)
-        manifest = getattr(loaded, "manifest", None)
-        kind = getattr(manifest, "kind", "standalone")
-        if action in {"enable", "disable"}:
-            if kind in {"exclusive", "model-provider"}:
-                return bad(handler, "This provider is managed in its provider settings", 409)
-            _set_plugin_enabled_in_active_config(plugin_key, action == "enable")
-            manager.discover_and_load(force=True)
-            return j(handler, {"ok": True, "key": plugin_key, "enabled": action == "enable"})
-
-        if getattr(manifest, "source", "") != "user":
-            return bad(handler, "Bundled and project plugins cannot be uninstalled here", 403)
-        target = Path(getattr(manifest, "path", "")).expanduser()
-        plugins_root = (get_active_hermes_home() / "plugins").resolve()
-        if target.is_symlink() or not target.is_dir():
-            return bad(handler, "Plugin directory is not safe to uninstall", 403)
-        resolved = target.resolve()
-        resolved.relative_to(plugins_root)
-        trash_root = get_active_hermes_home() / "plugin-trash"
-        trash_root.mkdir(parents=True, exist_ok=True)
-        stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-        destination = trash_root / f"{resolved.name}-{stamp}"
-        shutil.move(str(resolved), str(destination))
-        _set_plugin_enabled_in_active_config(plugin_key, False)
-        manager.discover_and_load(force=True)
-        return j(handler, {"ok": True, "key": plugin_key, "uninstalled": True})
+        from api.plugin_lifecycle import active_plugin_runtime_scope
+        with active_plugin_runtime_scope():
+            manager = _get_plugin_manager_for_visibility()
+            manager.discover_and_load(force=False)
+            loaded = (getattr(manager, "_plugins", {}) or {}).get(plugin_key)
+            if loaded is None:
+                return bad(handler, "Plugin not found", 404)
+            manifest = getattr(loaded, "manifest", None)
+            if action in {"enable", "disable"}:
+                if getattr(manifest, "kind", "standalone") in {"exclusive", "model-provider"}:
+                    return bad(handler, "This provider is managed in its provider settings", 409)
+                _set_plugin_enabled_in_active_config(plugin_key, action == "enable")
+                manager.discover_and_load(force=True)
+                return j(handler, {"ok": True, "key": plugin_key, "enabled": action == "enable"})
+            if getattr(manifest, "source", "") != "user":
+                return bad(handler, "Bundled and project plugins cannot be uninstalled here", 403)
+            from hermes_cli.plugins_skill_lifecycle import trash_user_plugin
+            trash_user_plugin(plugin_key)
+            reload_config()
+            return j(handler, {"ok": True, "key": plugin_key, "uninstalled": True})
     except (OSError, ValueError) as exc:
         return bad(handler, _sanitize_error(exc), 400)
     except Exception as exc:
