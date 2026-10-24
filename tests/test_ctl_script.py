@@ -1,5 +1,6 @@
 import os
 import shutil
+import shlex
 import subprocess
 import sys
 import textwrap
@@ -76,6 +77,9 @@ def write_fake_python(path: Path) -> None:
         ).lstrip(),
         encoding="utf-8",
     )
+    body = path.read_text()
+    body = body.replace("#!/usr/bin/env bash\n", "#!/usr/bin/env bash\nif [[ \"${1:-}\" == -c ]]; then exec " + shlex.quote(sys.executable) + " \"$@\"; fi\n", 1)
+    path.write_text(body)
     path.chmod(0o755)
 
 
@@ -242,11 +246,11 @@ def test_start_writes_pid_under_hermes_home_runs_foreground_no_browser_and_logs(
         assert not pid_file.exists()
 
 
-def test_start_uses_nohup_so_daemon_survives_launcher_exit():
+def test_start_detaches_new_session_so_daemon_survives_launcher_exit():
     ctl_text = CTL.read_text(encoding="utf-8")
 
-    assert "trap '' HUP" in ctl_text
-    assert 'exec nohup "${python_exe}"' in ctl_text
+    assert "start_new_session=True" in ctl_text
+    assert "stdin=subprocess.DEVNULL" in ctl_text
 
 
 def test_start_can_ignore_repo_dotenv_for_authoritative_test_env(tmp_path):
@@ -506,7 +510,7 @@ def test_start_allows_alternate_port_while_launchd_job_runs_on_default(tmp_path)
     # A fake python so `start` "launches" without needing the real server.
     fake_python = tmp_path / "fake-python"
     fake_python.write_text(
-        "#!/usr/bin/env bash\ntrap 'exit 0' TERM INT\nwhile true; do sleep 1; done\n",
+        "#!/usr/bin/env bash\nif [[ \"${1:-}\" == -c ]]; then exec " + shlex.quote(sys.executable) + " \"$@\"; fi\ntrap 'exit 0' TERM INT\nwhile true; do sleep 1; done\n",
         encoding="utf-8",
     )
     fake_python.chmod(0o755)
